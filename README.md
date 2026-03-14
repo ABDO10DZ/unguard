@@ -1,39 +1,43 @@
-# Project Title
+# UnGuard Documentation
 
-This is a sample README file for the UNGUARD project.
+UnGuard is a powerful tool designed for various use cases.
 
 ## Installation
 
-To install the project, follow the instructions below:
-
 ```bash
-npm install unguard
+pip install unguard
 ```
 
 ## Usage
 
-### Command Line
+### Basic Usage
 
-To run the application, use the following command:
+```python
+import unguard
 
-```bash
-unguard start
+result = unguard.process(data)
 ```
 
-### Configuration
-
-You can configure the application via the config.json file.
+### Advanced Usage
 
 ```bash
-{
-    "option1": true,
-    "option2": "value"
-}
+unguard --option value
 ```
+
+## Features
+
+- Feature 1
+- Feature 2
+- Feature 3
 
 ## Contributing
 
-Please follow the guidelines for contributing. Open issues and submit pull requests for any enhancements.
+1. Fork the repository.
+2. Create a new branch (`git checkout -b feature-xyz`).
+3. Make your changes.
+4. Commit your changes (`git commit -am 'Add feature xyz'`).
+5. Push to the branch (`git push origin feature-xyz`).
+6. Create a new Pull Request.
 
 ## License
 
