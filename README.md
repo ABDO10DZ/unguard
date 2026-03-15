@@ -11,7 +11,8 @@
 UnGuard is a powerful, all‑in‑one tool for Android security testing and educational bypass of in‑app purchases, integrity checks, ads, and more. It combines static analysis (smali patching) with optional runtime instrumentation to observe and learn from app behaviour, then apply that knowledge as additional static patches – all without needing a rooted device or Frida.
 
 ---
-
+<img src="unguard.png">
+---
 ## ✨ Features
 
 - **Multi‑category patching**
