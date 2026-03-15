@@ -127,15 +127,35 @@ _PLOCK = threading.Lock()
 #  Progress bar  (thread-safe, works alongside log())
 # ──────────────────────────────────────────────────────────────────────────────
 class Progress:
-    """ASCII progress bar that overwrites the same terminal line."""
-    BAR_W = 38
+    """
+    ASCII progress bar that overwrites the same terminal line.
+
+    Fixes vs previous version:
+    • Uses \\033[2K (ANSI erase-entire-line) before \\r so Termux doesn't
+      scroll a new line on each redraw.
+    • Heartbeat background thread redraws every 0.4 s so the bar always
+      ticks even when individual work items are very slow – no more
+      apparent hangs at 0%.
+    • update() / inc() are now fully thread-safe without deadlock.
+    """
+    BAR_W = 36
 
     def __init__(self, label: str, total: int):
-        self.label   = label
-        self.total   = max(total, 1)
-        self.current = 0
-        self._lock   = threading.Lock()
+        self.label    = label
+        self.total    = max(total, 1)
+        self.current  = 0
+        self._lock    = threading.Lock()
+        self._done_ev = threading.Event()
         self._draw(0)
+        # Heartbeat: redraws bar every 0.4 s regardless of work speed
+        self._hb = threading.Thread(target=self._heartbeat, daemon=True)
+        self._hb.start()
+
+    def _heartbeat(self):
+        while not self._done_ev.wait(timeout=0.4):
+            with self._lock:
+                n = self.current
+            self._draw(n)
 
     def update(self, n: int):
         with self._lock:
@@ -149,8 +169,11 @@ class Progress:
         self._draw(n)
 
     def done(self, msg: str = ""):
+        self._done_ev.set()          # stop heartbeat
+        self._hb.join(timeout=1.0)
         with _PLOCK:
-            sys.stdout.write("\r" + " " * 82 + "\r")
+            # \033[2K = erase entire line, then \r = go to column 0
+            sys.stdout.write("\033[2K\r" + " " * 84 + "\033[2K\r")
             sys.stdout.flush()
         if msg:
             log("ok", msg)
@@ -160,7 +183,8 @@ class Progress:
         filled = int(self.BAR_W * pct)
         bar    = C.G + "█" * filled + C.CY + "░" * (self.BAR_W - filled) + C.RS
         ts     = time.strftime("%H:%M:%S")
-        line   = (f"\r{C.CY}{ts}{C.RS} {C.CY}[~]{C.RS} "
+        # \033[2K erases the whole line first so Termux won't scroll
+        line   = (f"\033[2K\r{C.CY}{ts}{C.RS} {C.CY}[~]{C.RS} "
                   f"{self.label}  [{bar}] "
                   f"{C.BD}{n}/{self.total}{C.RS} ({pct:.0%})")
         with _PLOCK:
@@ -347,7 +371,8 @@ class SmaliCache:
                 used_b += len(content.encode("utf-8", errors="ignore"))
             else:
                 capped += 1   # leave out of _data; get() will read on-demand
-            if pb and (i % 100 == 0 or i == total - 1):
+            # Update every 50 files (was 100 – more responsive feel)
+            if pb and (i % 50 == 0 or i == total - 1):
                 pb.update(i + 1)
         self._mem_mb = used_b / (1024 * 1024)
         if pb:
@@ -399,15 +424,20 @@ class SmaliScanner:
 
     def scan(self, patterns: list[tuple[str,str]],
              label: str = "Scanning") -> dict[str, set[str]]:
-        """Returns {tag: set(rel_path)}. Compiles regexes once, reuses across files."""
+        """
+        Returns {tag: set(rel_path)}.
+        Uses submit()+as_completed() so the progress bar advances the moment
+        ANY file finishes – not in submission order. This eliminates the
+        apparent hang when the first file in the list is very large (e.g.
+        Unity IL2CPP generated smali with thousands of methods).
+        """
         compiled = [(re.compile(p, re.IGNORECASE), t) for p, t in patterns]
         bucket   = defaultdict(set)
         lock     = threading.Lock()
         items    = list(self.cache.items())
         total    = len(items)
         pb       = Progress(label, total) if total > 50 else None
-        done_ctr = [0]
-        done_lk  = threading.Lock()
+        done     = 0
 
         def _work(item):
             rel, text = item
@@ -416,15 +446,19 @@ class SmaliScanner:
             return [(t, rel) for pat, t in compiled if pat.search(text)]
 
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            for hits in ex.map(_work, items):
+            futs = {ex.submit(_work, item): item for item in items}
+            for fut in as_completed(futs):
+                try:
+                    hits = fut.result()
+                except Exception:
+                    hits = []
                 for t, rel in hits:
                     with lock:
                         bucket[t].add(rel)
-                with done_lk:
-                    done_ctr[0] += 1
-                    n = done_ctr[0]
-                if pb and (n % 100 == 0 or n == total):
-                    pb.update(n)
+                done += 1
+                # Update every 50 completions (more responsive than 100)
+                if pb and (done % 50 == 0 or done == total):
+                    pb.update(done)
 
         if pb:
             pb.done()
@@ -479,9 +513,12 @@ def _max_reg_index(lines: list[str], start: int, end: int) -> int:
     return highest + 1
 
 def _safe_replace_body(lines: list[str], start: int, end: int,
-                       new_body: list[str], locals_n: int) -> list[str]:
-    locals_line = f"    .locals {locals_n}\n"
-    return lines[:start+1] + [locals_line] + new_body + [lines[end]] + lines[end+1:]
+                       new_body: list[str], locals_n: int,
+                       tag: str = "replaced") -> list[str]:
+    locals_line  = f"    .locals {locals_n}\n"
+    marker_line  = f"    # UNGUARD: {tag}\n"
+    return (lines[:start+1] + [locals_line, marker_line]
+            + new_body + [lines[end]] + lines[end+1:])
 
 # ── FIX: Improved move-result finder ─────────────────────────────────────────
 #  The original looked at a fixed 5-line window including non-instruction lines.
@@ -794,7 +831,7 @@ class PatchEngine:
                 if end is None: i += 1; continue
                 cb  = self._find_callback(lines, i, end)
                 nb  = self._iap_success_body(cb)
-                lines = _safe_replace_body(lines, i, end, nb, locals_n=1)
+                lines = _safe_replace_body(lines, i, end, nb, locals_n=1, tag="iap:purchase-stub")
                 patched += 1
                 _REPORT.add("iap", rel, i, "purchase_method_stub")
                 log("patch", f"IAP purchase  {rel}  L{i}", indent=1)
@@ -808,7 +845,7 @@ class PatchEngine:
                 end = _method_end(lines, i)
                 if end is None: i += 1; continue
                 nb  = ["    const/4 v0, 0x1\n", "    return v0\n"]
-                lines = _safe_replace_body(lines, i, end, nb, locals_n=1)
+                lines = _safe_replace_body(lines, i, end, nb, locals_n=1, tag="iap:bool-gate→true")
                 patched += 1
                 _REPORT.add("iap", rel, i, "bool_gate_true")
                 log("patch", f"IAP bool gate  {rel}  L{i}", indent=1)
@@ -901,7 +938,7 @@ class PatchEngine:
                 else:
                     nb  = ["    const/4 v0, 0x0\n", "    return-object v0\n"]
                     loc = 1
-                lines = _safe_replace_body(lines, i, end, nb, loc)
+                lines = _safe_replace_body(lines, i, end, nb, loc, tag="integrity:stub")
                 patched += 1
                 _REPORT.add("integrity", rel, i, "integrity_stub")
                 log("patch", f"Integrity  {rel}  L{i}", indent=1)
@@ -1159,7 +1196,7 @@ class PatchEngine:
                 end = _method_end(lines, i)
                 if end is None: i += 1; continue
                 nb  = ["    return-void\n"]
-                lines = _safe_replace_body(lines, i, end, nb, locals_n=0)
+                lines = _safe_replace_body(lines, i, end, nb, locals_n=0, tag="ads:load-nop")
                 _REPORT.add("ads", rel, i, "load_nop")
                 patched += 1
                 log("patch", f"Ads load nop  {rel}  L{i}", indent=1)
@@ -1172,7 +1209,7 @@ class PatchEngine:
                 end = _method_end(lines, i)
                 if end is None: i += 1; continue
                 nb  = ["    return-void\n"]
-                lines = _safe_replace_body(lines, i, end, nb, locals_n=0)
+                lines = _safe_replace_body(lines, i, end, nb, locals_n=0, tag="ads:show-nop")
                 _REPORT.add("ads", rel, i, "show_nop")
                 patched += 1
                 log("patch", f"Ads show nop  {rel}  L{i}", indent=1)
@@ -1185,7 +1222,7 @@ class PatchEngine:
                 end = _method_end(lines, i)
                 if end is None: i += 1; continue
                 nb  = ["    const/4 v0, 0x0\n", "    return v0\n"]
-                lines = _safe_replace_body(lines, i, end, nb, locals_n=1)
+                lines = _safe_replace_body(lines, i, end, nb, locals_n=1, tag="ads:ready→false")
                 _REPORT.add("ads", rel, i, "ready_false")
                 patched += 1
                 log("patch", f"Ads isReady→false  {rel}  L{i}", indent=1)
@@ -1319,18 +1356,20 @@ class CustomObfuscationEngine:
             return hits
 
         total  = len(items)
-        done_n = [0]
-        done_lk = threading.Lock()
         pb     = Progress("Obfuscation scan", total) if total > 50 else None
+        done   = 0
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            for h in ex.map(_scan, items):
+            futs = {ex.submit(_scan, item): item for item in items}
+            for fut in as_completed(futs):
+                try:
+                    h = fut.result()
+                except Exception:
+                    h = {}
                 for k, v in h.items():
                     counts[k] += v
-                with done_lk:
-                    done_n[0] += 1
-                    n = done_n[0]
-                if pb and (n % 100 == 0 or n == total):
-                    pb.update(n)
+                done += 1
+                if pb and (done % 50 == 0 or done == total):
+                    pb.update(done)
         if pb:
             pb.done()
 
@@ -1392,17 +1431,18 @@ class CustomObfuscationEngine:
 
         items  = list(self.cache.items())
         count  = len(items)
-        done_n = [0]
-        done_lk = threading.Lock()
         pb     = Progress("Deobfuscating", count) if count > 50 else None
+        done   = 0
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            for n in ex.map(_deob, items):
-                total += n
-                with done_lk:
-                    done_n[0] += 1
-                    dn = done_n[0]
-                if pb and (dn % 100 == 0 or dn == count):
-                    pb.update(dn)
+            futs = {ex.submit(_deob, item): item for item in items}
+            for fut in as_completed(futs):
+                try:
+                    total += fut.result()
+                except Exception:
+                    pass
+                done += 1
+                if pb and (done % 50 == 0 or done == count):
+                    pb.update(done)
         if pb:
             pb.done(f"Deobfuscation complete: {total} transforms applied.")
         else:
@@ -1796,12 +1836,17 @@ class CommercialObfuscationDetector:
         "liapp":      [r"com/infraware/liapp"],
         "tencent":    [r"com/tencent/bugly",r"legu"],
     }
+    # Fixed: replaced (?:\S+\s+)* with enumerated optional modifiers.
+    # The old pattern caused catastrophic backtracking on large IL2CPP smali files
+    # (thousands of static methods per file, hundreds of backtrack paths each).
     _DG_STUBS = [
-        re.compile(r"\.method\s+(?:\S+\s+)*static\s+\S+\(I\)Ljava/lang/String;"),
-        re.compile(r"\.method\s+(?:\S+\s+)*static\s+\S+\(II\)Ljava/lang/String;"),
-        re.compile(r"\.method\s+(?:\S+\s+)*static\s+\S+\(J\)Ljava/lang/String;"),
+        re.compile(r"\.method\s+(?:(?:public|private|protected|static|final|synthetic|bridge|varargs)\s+)*static\s+\S+\(I\)Ljava/lang/String;"),
+        re.compile(r"\.method\s+(?:(?:public|private|protected|static|final|synthetic|bridge|varargs)\s+)*static\s+\S+\(II\)Ljava/lang/String;"),
+        re.compile(r"\.method\s+(?:(?:public|private|protected|static|final|synthetic|bridge|varargs)\s+)*static\s+\S+\(J\)Ljava/lang/String;"),
     ]
     _DG_BODY = ["aget-byte","xor-int","ushr-int","array-length"]
+    # Skip DexGuard stub scan on files larger than this to avoid stalls on giant files
+    _DG_SCAN_MAX_BYTES = 400_000  # 400 KB
     SCORE_MAP = {
         "dexguard":35,"dexguard_stubs":25,"arxan":40,"dasho":30,
         "appsealing":30,"bangcle":30,"ijiami":30,"jiagu360":30,
@@ -1828,31 +1873,48 @@ class CommercialObfuscationDetector:
             rel, text = item
             if not text: return {}
             local: dict[str, list[str]] = defaultdict(list)
+            # Simple string-match pre-filter speeds up the majority of files
             for tool, pats in compiled_sigs.items():
                 for pat in pats:
                     if pat.search(text): local[tool].append(rel); break
-            for sig_re in self._DG_STUBS:
-                for m in sig_re.finditer(text):
-                    end_idx = text.find(".end method", m.end())
-                    if end_idx == -1: continue
-                    body = text[m.end():end_idx]
-                    if sum(1 for mk in self._DG_BODY if mk in body) >= 2:
-                        local["dexguard_stubs"].append(rel); break
+            # DexGuard stub scan: skip very large files to prevent stalls.
+            # IL2CPP files can be 1-5 MB with thousands of static methods –
+            # running finditer on them would block the worker for minutes.
+            if len(text) <= self._DG_SCAN_MAX_BYTES:
+                for sig_re in self._DG_STUBS:
+                    matched = False
+                    for m in sig_re.finditer(text):
+                        end_idx = text.find("\n.end method", m.end())
+                        if end_idx == -1:
+                            end_idx = text.find(".end method", m.end())
+                        if end_idx == -1: continue
+                        # Cap body extraction to 4 KB to avoid huge slice
+                        body = text[m.end(): min(m.end() + 4096, end_idx)]
+                        if sum(1 for mk in self._DG_BODY if mk in body) >= 2:
+                            local["dexguard_stubs"].append(rel)
+                            matched = True
+                            break
+                    if matched:
+                        break
             return dict(local)
 
         total  = len(items)
-        done_n = [0]
-        done_lk = threading.Lock()
         pb     = Progress("Commercial scan", total) if total > 50 else None
+        done   = 0
+        # submit+as_completed: progress advances as soon as ANY file finishes.
+        # ex.map() would block at the first slow file forever.
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            for local in ex.map(_scan, items):
+            futs = {ex.submit(_scan, item): item for item in items}
+            for fut in as_completed(futs):
+                try:
+                    local = fut.result()
+                except Exception:
+                    local = {}
                 for k, v in local.items():
                     with lock: self.found[k].extend(v)
-                with done_lk:
-                    done_n[0] += 1
-                    n = done_n[0]
-                if pb and (n % 100 == 0 or n == total):
-                    pb.update(n)
+                done += 1
+                if pb and (done % 50 == 0 or done == total):
+                    pb.update(done)
         if pb:
             pb.done()
 
@@ -3117,8 +3179,10 @@ class InstrumentationInjector:
         r"\.method\s+(?:(?:public|protected|private|static|final)\s+)*"
         r"(?:isPremium|isSubscribed|hasPurchased|checkLicense|verifySignature|"
         r"validateReceipt|checkAppIntegrity|attest|requestIntegrityToken|"
-        r"checkPurchase|verifyPurchase|isEntitled|isActivated|isProUser|"
-        r"validateToken|verifyInstall|verifyDevice)\b"
+        r"checkPurchase|verifyPurchase|isEntitled|checkEntitlement|"
+        r"isActivated|isProUser|validateToken|verifyInstall|verifyDevice|"
+        r"isPurchased|isBought|isVip|isPaid|isMember|hasAccess|"
+        r"checkSignature|checkIntegrity|validateLicense|checkSubscription)\b"
     )
 
     # OkHttpClient.Builder.build() call sites to inject our interceptor before
