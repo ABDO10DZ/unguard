@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # unguard.py
 """
-UnGuard v3.0.0 – Hybrid Static + Runtime Analysis
+UnGuard v3.3.1 – Hybrid Static + Runtime Analysis
 ========================
 Detect · Deobfuscate · Patch · Rebuild · Sign
+
+New in v3.3.1:
+  --fake-google-verify  : Intercept Google validation requests (licensing, purchase verify)
+                           and return a hardcoded success response without contacting Google.
+                           Works together with --tls-intercept.
 
 Patch categories (combine freely with --patch):
   iap        : Google Play / Amazon / Huawei IAP · premium gates
@@ -23,43 +28,6 @@ Obfuscation support:
   Custom     : XOR/AES strings · String-arrays · StringBuilder chains
                Opaque predicates · Dead-goto chains · DexClassLoader packers
                Native JNI stubs · Reflection hiding
-
-Changes vs v2.0.0  (v3.0.0)
-----------------------------
-* RuntimeConfig: modular opt-in feature flags (--trace-runtime, --tls-intercept,
-  --learn, --hybrid, --net-debug). Base pipeline completely unaffected when unused.
-* InstrumentationInjector: writes UGBridge.smali + ConnThread into decompiled APK,
-  hooks Activity/Fragment/Service lifecycle, injects OkHttp interceptor, bumps
-  .locals safely for each injected hook.
-* BridgeServer: TCP event receiver (newline-delimited JSON) – streams live from APK.
-* BehaviorProfileDB: SQLite-backed profile recording all runtime events.
-* LearningEngine: auto-discovers premium gates, analytics, storage tokens; generates
-  override rules keyed by URL fingerprint.
-* ReplayEngine: converts learned rules into additional static smali patches (hybrid mode).
-* ExceptionAnalyzer: classifies runtime exceptions → TLS pinning / integrity / anti-debug;
-  prints targeted patch suggestions inline.
-* LiveConsole: colour-coded real-time event stream with per-tag stats.
-* HybridEngine: orchestrates learn→patch pipeline; loads rules file for --hybrid runs.
-* Network Security Config injection (--tls-intercept): trusts system + user CAs,
-  disables cleartext restrictions, removes domain-level pinning declarations.
-* _print_runtime_instructions: post-build ADB/proxy setup guidance.
-
-Changes vs v1.0.0
------------------
-* Atomic smali writes via temp-file + os.replace (no corruption on interrupt)
-* Fixed move-result tracker: skips .line / labels / blank lines between
-  invoke and move-result (obfuscation-resilient)
-* Register alias propagation: after injecting a const, follow move-vX,vY
-  chains so aliased registers are also corrected
-* SmaliCache: memory-usage estimation + configurable cap with lazy fallback
-* Parallel file-level patching (ThreadPoolExecutor per category)
-* Post-patch verification: confirms UNGUARD markers were written
-* Signing: jarsigner fallback now uses SHA256withRSA + tool pre-check
-* Framework detector: no hard file-cap on smali scan (with per-fw early stop)
-* PatchReport: structured JSON-serialisable report (--report flag)
-* Improved opaque-predicate removal (handles const/4 0x1 conditionals)
-* More precise _INTEGRITY_RE to avoid matching unrelated onFailure methods
-* macOS / Darwin detected as a valid POSIX environment
 """
 
 from __future__ import annotations
@@ -113,7 +81,7 @@ ZIPALIGN     = os.environ.get("ZIPALIGN",     "zipalign")
 APKSIGNER    = os.environ.get("APKSIGNER",    "apksigner")
 BUNDLETOOL   = os.environ.get("BUNDLETOOL",   "bundletool.jar")
 TOOL_NAME    = "UnGuard"
-TOOL_VERSION = "3.0.0"
+TOOL_VERSION = "3.3.1"
 MAX_WORKERS  = int(os.environ.get("MAX_WORKERS", str(min(os.cpu_count() or 4, 8))))
 # SmaliCache memory cap in MB – files beyond this are read on-demand instead of cached
 CACHE_MAX_MB = int(os.environ.get("CACHE_MAX_MB", "512"))
@@ -178,15 +146,34 @@ class Progress:
         if msg:
             log("ok", msg)
 
+    # Throttle redraws: no faster than every 80 ms (avoids burst interleaving)
+    _DRAW_INTERVAL = 0.08
+
     def _draw(self, n: int):
-        pct    = min(n / self.total, 1.0)
+        now = time.monotonic()
+        # Throttle: skip if drawn too recently (except on 0% and 100%)
+        pct = min(n / self.total, 1.0)
+        with self._lock:
+            last = getattr(self, "_last_draw", 0.0)
+            if pct not in (0.0, 1.0) and (now - last) < self._DRAW_INTERVAL:
+                return
+            object.__setattr__(self, "_last_draw", now)
         filled = int(self.BAR_W * pct)
         bar    = C.G + "█" * filled + C.CY + "░" * (self.BAR_W - filled) + C.RS
         ts     = time.strftime("%H:%M:%S")
-        # \033[2K erases the whole line first so Termux won't scroll
-        line   = (f"\033[2K\r{C.CY}{ts}{C.RS} {C.CY}[~]{C.RS} "
-                  f"{self.label}  [{bar}] "
-                  f"{C.BD}{n}/{self.total}{C.RS} ({pct:.0%})")
+        # \033[2K erases entire line; \r returns to column 0 without newline.
+        # On Termux we also check if stdout is a real tty.
+        if sys.stdout.isatty():
+            line = (f"\033[2K\r{C.CY}{ts}{C.RS} {C.CY}[~]{C.RS} "
+                    f"{self.label}  [{bar}] "
+                    f"{C.BD}{n}/{self.total}{C.RS} ({pct:.0%})")
+        else:
+            # Non-tty (piped / redirected): print on new line at 0/25/50/75/100%
+            thresholds = {0, 25, 50, 75, 100}
+            if int(pct * 100) not in thresholds:
+                return
+            line = (f"\n{C.CY}{ts}{C.RS} {C.CY}[~]{C.RS} "
+                    f"{self.label}  {int(pct*100):3d}%  {n}/{self.total}")
         with _PLOCK:
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -223,8 +210,9 @@ def banner():
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"""{C.BD}{C.CY}
   +============================================================+
-  |  UnGuard v3.0.0  Hybrid Analysis Framework                 |
+  |  UnGuard v3.3.1  Hybrid Analysis Framework                 |
   |  --patch all  --trace-runtime  --tls-intercept  --learn   |
+  |  --fake-google-verify                                       |
   |  Unity  Unreal  Flutter  Native   Multi-threaded          |
   |  --hybrid  --net-debug  │  DexGuard  Arxan  DashO         |
   +============================================================+{C.RS}
@@ -331,6 +319,334 @@ def patches_to_label(patches: frozenset) -> str:
 #  FIX: Added memory-usage estimation with configurable cap.
 #       Files exceeding the cap are read on-demand (lazy) rather than cached.
 #       Added per-file size accounting to avoid OOM on giant apps.
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SmaliAST  –  Structured Smali Parser
+#
+#  Replaces raw-regex line scanning for structural decisions (method boundaries,
+#  return types, parameter counts, field names) where regex gives false positives
+#  from string literals and commented-out code.
+#
+#  Design:  one-pass O(N) line scanner → dataclass tree.
+#           No backtracking, no external dependencies.
+#           Regex is still used for CONTENT matching (find IAP signatures etc.)
+#           but SmaliAST owns STRUCTURE parsing (what IS a method, what IS its
+#           return type, how many params does it take).
+# ──────────────────────────────────────────────────────────────────────────────
+from dataclasses import dataclass as _dc, field as _field
+from typing import Optional as _Opt
+
+@_dc
+class SmaliInstr:
+    """A single smali instruction or directive (non-blank, non-pure-comment)."""
+    line_no  : int          # 0-based index into the source line list
+    opcode   : str          # first token: invoke-virtual, const/4, .line, :label…
+    raw      : str          # full stripped line content
+
+@_dc
+class SmaliMethod:
+    """One .method … .end method block."""
+    line_start  : int                   # index of ".method …" line
+    line_end    : int                   # index of ".end method" line
+    declaration : str                   # full declaration text (stripped)
+    name        : str                   # method name (before "(")
+    descriptor  : str                   # full JVM descriptor e.g. "(IZ)V"
+    return_type : str                   # return type e.g. "V","Z","I","Ljava/…;"
+    is_static   : bool
+    is_abstract : bool
+    is_native   : bool
+    param_count : int                   # number of JVM parameter slots
+    locals_n    : int                   # value of .locals directive (−1 if absent)
+    locals_line : int                   # index of .locals line (−1 if absent)
+    instrs      : list["SmaliInstr"]    # non-blank, non-comment instruction lines
+
+@_dc
+class SmaliField:
+    """A .field declaration."""
+    line_no     : int
+    declaration : str
+    name        : str
+    type_       : str
+
+@_dc
+class SmaliClass:
+    """Top-level parsed representation of one .smali file."""
+    path        : str                   # filesystem path
+    class_decl  : str                   # ".class …" line
+    super_decl  : str                   # ".super …" line
+    class_name  : str                   # Lfoo/Bar;
+    super_name  : str                   # Ljava/lang/Object;
+    implements  : list[str]             # list of Lfoo/Iface;
+    fields      : list[SmaliField]
+    methods     : list[SmaliMethod]
+    source_lines: list[str]             # original readlines() content (mutable)
+
+# ── JVM descriptor helpers ────────────────────────────────────────────────────
+_PRIM_WIDTHS = {
+    "J": 2, "D": 2,   # long, double occupy two register slots
+    "B": 1, "C": 1, "F": 1, "I": 1, "S": 1, "Z": 1,
+}
+
+def _count_jvm_params(descriptor: str) -> int:
+    """Count JVM parameter register slots from a method descriptor.
+    Longs and doubles each use 2 slots; everything else uses 1."""
+    if "(" not in descriptor or ")" not in descriptor:
+        return 0
+    params_str = descriptor[descriptor.index("(")+1 : descriptor.rindex(")")]
+    count = 0
+    i = 0
+    while i < len(params_str):
+        c = params_str[i]
+        if c == "L":
+            j = params_str.index(";", i)
+            count += 1; i = j + 1
+        elif c == "[":
+            # array – skip dimension chars, then the element type
+            while i < len(params_str) and params_str[i] == "[":
+                i += 1
+            if i < len(params_str):
+                if params_str[i] == "L":
+                    j = params_str.index(";", i)
+                    i = j + 1
+                else:
+                    i += 1
+            count += 1
+        elif c in _PRIM_WIDTHS:
+            count += _PRIM_WIDTHS[c]; i += 1
+        else:
+            i += 1
+    return count
+
+def _return_type_from_descriptor(descriptor: str) -> str:
+    """Extract the return type from a JVM method descriptor."""
+    if ")" not in descriptor:
+        return "V"
+    return descriptor[descriptor.rindex(")") + 1:]
+
+# ── One-pass parser ───────────────────────────────────────────────────────────
+_CLASS_RE   = re.compile(r"\.class\s+(.*?)\s+(L[^;]+;)")
+_SUPER_RE   = re.compile(r"\.super\s+(L[^;]+;)")
+_IMPL_RE    = re.compile(r"\.implements\s+(L[^;]+;)")
+_FIELD_RE   = re.compile(r"\.field\s+(.*?)\s+(\w+):(.*)")
+_METHOD_RE  = re.compile(
+    r"\.method\s+((?:(?:public|private|protected|static|final|"
+    r"synchronized|bridge|varargs|synthetic|abstract|native|transient)\s+)*)([^(]+)(\([^)]*\).*)"
+)
+_LOCALS_RE  = re.compile(r"[ \t]+\.locals\s+(\d+)")
+_OPCODE_RE  = re.compile(r"^\s+([a-z][\w/-]*)\s*")
+
+def parse_smali(path: str, source: _Opt[list[str]] = None) -> _Opt[SmaliClass]:
+    """
+    Parse a .smali file into a SmaliClass AST.
+
+    Parameters
+    ----------
+    path   : filesystem path to the .smali file
+    source : pre-loaded list of lines (avoids a second read if already cached)
+
+    Returns None on parse error.
+    """
+    if source is None:
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                source = fh.readlines()
+        except Exception:
+            return None
+
+    cls_name = super_name = class_decl = super_decl = ""
+    implements: list[str] = []
+    fields:  list[SmaliField]  = []
+    methods: list[SmaliMethod] = []
+
+    in_method    = False
+    m_start      = -1
+    m_decl       = ""
+    m_name       = ""
+    m_desc       = ""
+    m_is_static  = False
+    m_is_abstract= False
+    m_is_native  = False
+    m_locals_n   = -1
+    m_locals_ln  = -1
+    m_instrs: list[SmaliInstr] = []
+
+    in_annotation = 0    # nesting counter for .annotation … .end annotation
+
+    for i, raw in enumerate(source):
+        stripped = raw.strip()
+
+        # Skip blank lines and pure comments everywhere
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        # Annotation blocks – skip content (multi-line directives that can
+        # contain fake-looking method names or class references)
+        if stripped.startswith(".annotation"):
+            in_annotation += 1
+            continue
+        if stripped.startswith(".end annotation"):
+            in_annotation = max(0, in_annotation - 1)
+            continue
+        if in_annotation:
+            continue
+
+        first = stripped.split()[0] if stripped.split() else ""
+
+        # ── Top-level directives (outside method) ─────────────────────────
+        if not in_method:
+            if first == ".class":
+                class_decl = stripped
+                m2 = _CLASS_RE.search(stripped)
+                if m2:
+                    cls_name = m2.group(2)
+            elif first == ".super":
+                super_decl = stripped
+                m2 = _SUPER_RE.search(stripped)
+                if m2:
+                    super_name = m2.group(1)
+            elif first == ".implements":
+                m2 = _IMPL_RE.search(stripped)
+                if m2:
+                    implements.append(m2.group(1))
+            elif first == ".field":
+                m2 = _FIELD_RE.search(stripped)
+                if m2:
+                    fields.append(SmaliField(
+                        line_no=i, declaration=stripped,
+                        name=m2.group(2), type_=m2.group(3).strip()))
+            elif first == ".method":
+                m2 = _METHOD_RE.search(stripped)
+                if m2:
+                    flags_str  = m2.group(1)
+                    m_name     = m2.group(2).strip()
+                    m_desc     = m2.group(3).strip()
+                    m_is_static   = "static" in flags_str
+                    m_is_abstract = "abstract" in flags_str
+                    m_is_native   = "native" in flags_str
+                    m_start    = i
+                    m_decl     = stripped
+                    m_locals_n = m_locals_ln = -1
+                    m_instrs   = []
+                    in_method  = True
+
+        else:
+            # ── Inside a method ───────────────────────────────────────────
+            if first == ".end" and (stripped == ".end method"
+                                   or stripped.startswith(".end method ")):
+                # Allow trailing comments: ".end method # generated" etc.
+                # Finalise method
+                ret_type = _return_type_from_descriptor(m_desc)
+                param_slots = _count_jvm_params(m_desc)
+                methods.append(SmaliMethod(
+                    line_start  = m_start,
+                    line_end    = i,
+                    declaration = m_decl,
+                    name        = m_name,
+                    descriptor  = m_desc,
+                    return_type = ret_type,
+                    is_static   = m_is_static,
+                    is_abstract = m_is_abstract,
+                    is_native   = m_is_native,
+                    param_count = param_slots,
+                    locals_n    = m_locals_n,
+                    locals_line = m_locals_ln,
+                    instrs      = m_instrs,
+                ))
+                in_method = False
+            elif first == ".locals":
+                m2 = _LOCALS_RE.match(raw)
+                if m2:
+                    m_locals_n  = int(m2.group(1))
+                    m_locals_ln = i
+                m_instrs.append(SmaliInstr(line_no=i, opcode=first, raw=stripped))
+            elif first.startswith(":"):
+                # label – record but mark as label
+                m_instrs.append(SmaliInstr(line_no=i, opcode=first, raw=stripped))
+            elif first.startswith("."):
+                # sub-directives (.line, .param, .restart local, .catch, …)
+                m_instrs.append(SmaliInstr(line_no=i, opcode=first, raw=stripped))
+            else:
+                # Real instruction
+                m2 = _OPCODE_RE.match(raw)
+                opcode = m2.group(1) if m2 else first
+                m_instrs.append(SmaliInstr(line_no=i, opcode=opcode, raw=stripped))
+
+    if not cls_name:
+        return None   # not a valid smali file
+
+    return SmaliClass(
+        path         = path,
+        class_decl   = class_decl,
+        super_decl   = super_decl,
+        class_name   = cls_name,
+        super_name   = super_name,
+        implements   = implements,
+        fields       = fields,
+        methods      = methods,
+        source_lines = source,
+    )
+
+
+def smali_method_has_sig(method: SmaliMethod, sig: str) -> bool:
+    """Return True if ANY instruction in the method body contains sig.
+    Unlike regex on raw text this ONLY searches actual instructions –
+    not string literal arguments, not comments, not annotation values."""
+    return any(sig in instr.raw for instr in method.instrs)
+
+
+def smali_find_methods_by_name(cls: SmaliClass, name_pattern: str) -> list[SmaliMethod]:
+    """Return methods whose name matches a compiled-regex pattern."""
+    pat = re.compile(name_pattern)
+    return [m for m in cls.methods if pat.search(m.name)]
+
+
+def smali_find_methods_containing(cls: SmaliClass, sig: str) -> list[SmaliMethod]:
+    """Return methods that reference sig anywhere in their instructions."""
+    return [m for m in cls.methods if smali_method_has_sig(m, sig)]
+
+
+def smali_locals_safe_to_bump(method: SmaliMethod, by: int = 2) -> bool:
+    """
+    Return True if bumping .locals by `by` is safe.
+    Unsafe if:
+      - new count > 250 (dexlib2 cap)
+      - registers v{old_n}..v{old_n+by-1} already appear in the method body
+        (they may be parameter aliases inserted by an obfuscator)
+    """
+    if method.is_abstract or method.is_native:
+        return False
+    old_n = method.locals_n
+    if old_n < 0:
+        return False
+    if old_n + by > 250:
+        return False
+    new_regs = set(range(old_n, old_n + by))
+    body_text = " ".join(instr.raw for instr in method.instrs)
+    for r in new_regs:
+        if re.search(r"\bv" + str(r) + r"\b", body_text):
+            return False
+    return True
+
+
+def smali_bump_locals(method: SmaliMethod, source_lines: list[str],
+                      by: int = 2) -> _Opt[int]:
+    """
+    Bump .locals in source_lines by `by` and return the index of the first
+    new free register (old_n). Returns None if unsafe or .locals not found.
+    """
+    if not smali_locals_safe_to_bump(method, by):
+        return None
+    ll = method.locals_line
+    if ll < 0:
+        return None
+    old_n = method.locals_n
+    # Patch the actual source line
+    source_lines[ll] = re.sub(
+        r"([ \t]+\.locals\s+)(\d+)",
+        lambda m2: f"{m2.group(1)}{old_n + by}",
+        source_lines[ll], count=1)
+    return old_n   # caller uses v{old_n} and v{old_n+by-1} as free registers
+
 # ──────────────────────────────────────────────────────────────────────────────
 class SmaliCache:
     """
@@ -345,12 +661,20 @@ class SmaliCache:
         self._loaded  = False
         self._mem_mb  = 0.0
 
+    # Directories that never contain smali files – skip entirely
+    _SKIP_DIRS = frozenset({"res", "assets", "lib", "libs", "unknown",
+                             "original", "kotlin", "META-INF"})
+
     def load(self, show_progress: bool = True):
         if self._loaded:
             return
         t0 = time.time()
         all_files = []
-        for root, _, files in os.walk(str(self.base)):
+        for root, dirs, files in os.walk(str(self.base)):
+            # Prune non-smali dirs in-place so os.walk doesn't descend into them
+            rel_root = os.path.relpath(root, str(self.base))
+            if rel_root == ".":
+                dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS]
             for fname in files:
                 if fname.endswith(".smali"):
                     all_files.append(os.path.join(root, fname))
@@ -359,21 +683,49 @@ class SmaliCache:
         used_b  = 0
         pb      = Progress("Loading smali", total) if show_progress and total > 50 else None
         capped  = 0
-        for i, full in enumerate(all_files):
-            rel = os.path.relpath(full, str(self.base))
-            self._all_rels.append(rel)
-            if used_b < cap_b:
+
+        # Parallel read: use a thread pool to read all files concurrently.
+        # On Termux (ARM, slow eMMC) this gives 2-4x speedup over sequential.
+        def _read(full):
+            try:
+                return Path(full).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return ""
+
+        rels = [os.path.relpath(f, str(self.base)) for f in all_files]
+        self._all_rels = rels[:]
+
+        # Only parallel-read up to the cap; beyond it we read on-demand.
+        # Determine how many files fit in the cap by estimated average size.
+        # Use a conservative 8 KB average – real smali averages 2-6 KB.
+        est_files_in_cap = min(total, max(1, int(cap_b // 8192)))
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = {ex.submit(_read, all_files[i]): i
+                    for i in range(min(est_files_in_cap, total))}
+            done = 0
+            for fut in as_completed(futs):
+                idx_f = futs[fut]
+                rel   = rels[idx_f]
                 try:
-                    content = Path(full).read_text(encoding="utf-8", errors="ignore")
+                    content = fut.result()
                 except Exception:
                     content = ""
-                self._data[rel] = content
-                used_b += len(content.encode("utf-8", errors="ignore"))
-            else:
-                capped += 1   # leave out of _data; get() will read on-demand
-            # Update every 50 files (was 100 – more responsive feel)
-            if pb and (i % 50 == 0 or i == total - 1):
-                pb.update(i + 1)
+                size = len(content.encode("utf-8", errors="ignore"))
+                if used_b + size <= cap_b:
+                    self._data[rel] = content
+                    used_b += size
+                else:
+                    capped += 1
+                done += 1
+                if pb and (done % 200 == 0 or done == total):
+                    pb.update(done)
+
+        # Any files beyond est_files_in_cap are on-demand only
+        for i in range(est_files_in_cap, total):
+            capped += 1
+            if pb:
+                pb.update(min(est_files_in_cap + 1, total))
         self._mem_mb = used_b / (1024 * 1024)
         if pb:
             pb.done(f"Loaded {total - capped}/{total} smali files "
@@ -413,7 +765,6 @@ class SmaliCache:
             return (self.base / rel).read_text(encoding="utf-8", errors="ignore")
         except Exception:
             return ""
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  Parallel pattern scanner (uses cache)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -426,12 +777,24 @@ class SmaliScanner:
              label: str = "Scanning") -> dict[str, set[str]]:
         """
         Returns {tag: set(rel_path)}.
-        Uses submit()+as_completed() so the progress bar advances the moment
-        ANY file finishes – not in submission order. This eliminates the
-        apparent hang when the first file in the list is very large (e.g.
-        Unity IL2CPP generated smali with thousands of methods).
+
+        Optimisations over the naive approach:
+          1. Early-exit per tag: once a file matches the first pattern for a
+             given tag it is recorded and that tag is skipped for the rest of
+             the file.  A billing file with 40 gplay patterns only checks the
+             first one that matches.
+          2. submit()+as_completed(): progress advances as ANY file finishes,
+             not in submission order.  Prevents apparent hangs on giant IL2CPP
+             files.
+          3. Pre-compile all regexes once before dispatching workers.
         """
-        compiled = [(re.compile(p, re.IGNORECASE), t) for p, t in patterns]
+        # Group patterns by tag so we can early-exit per tag
+        from collections import defaultdict as _dd
+        tag_pats: dict[str, list] = _dd(list)
+        for p, t in patterns:
+            tag_pats[t].append(re.compile(p, re.IGNORECASE))
+        tag_order = list(tag_pats.keys())
+
         bucket   = defaultdict(set)
         lock     = threading.Lock()
         items    = list(self.cache.items())
@@ -443,7 +806,13 @@ class SmaliScanner:
             rel, text = item
             if not text:
                 return []
-            return [(t, rel) for pat, t in compiled if pat.search(text)]
+            hits = []
+            for tag in tag_order:
+                for pat in tag_pats[tag]:
+                    if pat.search(text):
+                        hits.append((tag, rel))
+                        break          # ← early-exit: one match per tag per file
+            return hits
 
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
             futs = {ex.submit(_work, item): item for item in items}
@@ -456,8 +825,7 @@ class SmaliScanner:
                     with lock:
                         bucket[t].add(rel)
                 done += 1
-                # Update every 50 completions (more responsive than 100)
-                if pb and (done % 50 == 0 or done == total):
+                if pb and (done % 100 == 0 or done == total):
                     pb.update(done)
 
         if pb:
@@ -471,7 +839,9 @@ class SmaliScanner:
 #       Interrupted writes no longer corrupt the original file.
 # ──────────────────────────────────────────────────────────────────────────────
 def _atomic_write(path: str, lines: list[str]) -> bool:
-    """Write lines to path atomically.  Returns True on success."""
+    """Write lines to path atomically via mkstemp + os.replace (crash-safe).
+    On Windows, os.replace may raise PermissionError if the target file is
+    momentarily open (e.g. antivirus scan). Retry once after 50 ms."""
     dir_ = os.path.dirname(os.path.abspath(path))
     try:
         fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".ug_tmp")
@@ -479,10 +849,21 @@ def _atomic_write(path: str, lines: list[str]) -> bool:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.writelines(lines)
         except Exception:
-            os.unlink(tmp)
+            try: os.unlink(tmp)
+            except Exception: pass
             raise
-        os.replace(tmp, path)   # atomic on POSIX; best-effort on Windows
-        return True
+        # Retry with exponential backoff (Windows AV / file-lock races)
+        delay = 0.05
+        for _attempt in range(4):
+            try:
+                os.replace(tmp, path)
+                return True
+            except PermissionError:
+                if _attempt == 3:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+        return True   # unreachable but satisfies type checker
     except Exception as e:
         log("warn", f"Atomic write failed for {path}: {e}")
         return False
@@ -529,23 +910,38 @@ _NON_CODE_RE = re.compile(
 )
 
 def _next_move_result_idx(lines: list[str], from_idx: int,
-                           lookahead: int = 12) -> int | None:
+                           lookahead: int = 64) -> int | None:
     """
-    Return the line index of the next move-result(-object|-wide) after from_idx,
-    skipping blank lines, .line directives, and labels.
-    FIX: window expanded to 12 and non-code lines skipped explicitly.
+    Return the line index of the next move-result(-object|-wide) after from_idx.
+
+    Skips blank lines, comments, .line directives, labels, and nop instructions.
+    Stops at the first REAL instruction that is not move-result.
+
+    lookahead=64: aggressive obfuscators (DexGuard, Arxan) inject 30-50 .line
+    directives between invoke and move-result. We use instruction-counting rather
+    than line-counting: we stop when we see a non-move-result real instruction,
+    regardless of how many non-code lines we passed. The lookahead only caps the
+    absolute line window as a safety net against infinite loops.
     """
+    real_instrs_seen = 0
     for j in range(from_idx + 1, min(from_idx + 1 + lookahead, len(lines))):
         s = lines[j].strip()
+        if not s or s.startswith("#"):
+            continue                        # blank / comment – skip
         if re.match(r"move-result(?:-object|-wide)?\s+[vp]\d+", s):
-            return j
-        # Stop if we hit another instruction that is not a non-code line
-        if s and not _NON_CODE_RE.match(lines[j]):
-            break
+            return j                        # found it
+        if _NON_CODE_RE.match(lines[j]):
+            continue                        # .line / label / directive – skip
+        if s == "nop":
+            continue                        # nop is harmless
+        # Real instruction that is NOT move-result
+        real_instrs_seen += 1
+        if real_instrs_seen >= 2:
+            break   # two real instructions without finding move-result → give up
     return None
 
 def _next_move_result(lines: list[str], from_idx: int,
-                      lookahead: int = 12) -> str | None:
+                      lookahead: int = 32) -> str | None:
     """Return register name (e.g. 'v0') of the next move-result, or None."""
     j = _next_move_result_idx(lines, from_idx, lookahead)
     if j is None:
@@ -564,7 +960,13 @@ def _propagate_register_alias(lines: list[str], inject_idx: int,
     From inject_idx forward until method_end_idx, find `move vY, source_reg`
     instructions and insert a matching `const/4 vY, const_val` after each.
     Returns count of additional propagations inserted.
+    v>15 guard: skip if source_reg is v16+ (const/4 uses 4-bit register field).
     """
+    try:
+        if source_reg.startswith("v") and int(source_reg[1:]) > 15:
+            return 0
+    except (ValueError, IndexError):
+        pass
     added = 0
     i = inject_idx + 1
     alias_regs = {source_reg}
@@ -575,6 +977,12 @@ def _propagate_register_alias(lines: list[str], inject_idx: int,
         if m:
             dest, src = m.group(1), m.group(2)
             if src in alias_regs and dest not in alias_regs:
+                # Skip if dest > v15 (const/4 is 4-bit)
+                try:
+                    if dest.startswith("v") and int(dest[1:]) > 15:
+                        i += 1; continue
+                except (ValueError, IndexError):
+                    pass
                 alias_regs.add(dest)
                 lines.insert(i + 1,
                     f"    const/4 {dest}, {const_val}  "
@@ -591,6 +999,54 @@ def _propagate_register_alias(lines: list[str], inject_idx: int,
 #       Logs a warning if no markers are found (silent patch failure detection).
 # ──────────────────────────────────────────────────────────────────────────────
 _UNGUARD_MARKER_RE = re.compile(r"#\s*UNGUARD", re.IGNORECASE)
+
+def _verify_dex_contains_patches(apk_path: str) -> bool:
+    """
+    Open the rebuilt APK as a ZIP, extract the string table from each DEX,
+    and check that at least one UNGUARD string exists.
+    This catches the case where apktool compiled from the wrong directory
+    and the patches never made it into the final bytecode.
+    Returns True if verified (or if APK cannot be opened – don't block).
+    """
+    try:
+        import zipfile as _zf, struct as _st
+        with _zf.ZipFile(apk_path, "r") as z:
+            dex_names = [n for n in z.namelist() if n.endswith(".dex")]
+            for dex_name in dex_names:
+                data = z.read(dex_name)
+                if len(data) < 0x70:
+                    continue
+                # Read string table
+                str_ids_size = _st.unpack_from("<I", data, 0x38)[0]
+                str_ids_off  = _st.unpack_from("<I", data, 0x3c)[0]
+                for idx in range(min(str_ids_size, 80000)):
+                    off = _st.unpack_from("<I", data, str_ids_off + idx * 4)[0]
+                    p = off
+                    length = 0; shift = 0
+                    while p < len(data):
+                        b = data[p]; p += 1
+                        length |= (b & 0x7f) << shift
+                        if not (b & 0x80): break
+                        shift += 7
+                    if length < 6 or p + length > len(data):
+                        continue
+                    try:
+                        s = data[p:p + length].decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    # "UNGUARD" comments are stripped at compile time.
+                    # Look for strings that our patches ACTUALLY inject into bytecode:
+                    # - "unguard"  from purchaseToken in const-string
+                    # - "bypass"   from productId in const-string  
+                    # - "com/ug/rt" from runtime bridge class refs
+                    sl = s.lower()
+                    if (sl == "unguard" or sl == "bypass"
+                            or "com/ug/rt" in s
+                            or s == "purchaseToken"):
+                        return True
+    except Exception:
+        pass  # Verification is best-effort; never block the pipeline
+    return False
 
 def _verify_patch(path: str, expected_min: int = 1) -> bool:
     """Return True if the file contains at least expected_min UNGUARD markers."""
@@ -614,40 +1070,123 @@ class PatchEngine:
 
     # ── Detection pattern banks ───────────────────────────────────────────────
     IAP_PATTERNS = [
-        (r"Lcom/android/billingclient/api/BillingClient;",             "gplay"),
-        (r"Lcom/android/billingclient/api/PurchasesUpdatedListener;",  "gplay"),
-        (r"Lcom/android/billingclient/api/ProductDetails;",            "gplay"),
-        (r"Lcom/android/billingclient/api/BillingFlowParams;",         "gplay"),
-        (r"Lcom/android/billingclient/api/ConsumeParams;",             "gplay"),
-        (r"Lcom/android/billingclient/api/Purchase;",                  "gplay"),
-        (r"->launchBillingFlow",                                       "gplay"),
-        (r"->queryProductDetailsAsync",                                "gplay"),
-        (r"->acknowledgePurchase",                                     "gplay"),
-        (r"->consumeAsync",                                            "gplay"),
-        (r"Lcom/amazon/device/iap/PurchasingService;",                 "amazon"),
-        (r"Lcom/amazon/device/iap/model/Receipt;",                     "amazon"),
-        (r"Lcom/huawei/hms/iap/IapClient;",                           "huawei"),
-        (r"Lcom/huawei/hms/iap/entity/InAppPurchaseData;",            "huawei"),
-        (r"purchase|billing|ProductDetails|SKU_DETAILS",              "generic"),
-        (r"isPremium|isSubscribed|hasPurchased|isPurchased",          "generic"),
-        (r"PURCHASE_STATE_PURCHASED|purchaseState",                   "generic"),
+        # ── Google Play Billing v3-v6 ─────────────────────────────────────────
+        (r"Lcom/android/billingclient/api/BillingClient;",                     "gplay"),
+        (r"Lcom/android/billingclient/api/PurchasesUpdatedListener;",          "gplay"),
+        (r"Lcom/android/billingclient/api/ProductDetails;",                    "gplay"),
+        (r"Lcom/android/billingclient/api/BillingFlowParams;",                 "gplay"),
+        (r"Lcom/android/billingclient/api/ConsumeParams;",                     "gplay"),
+        (r"Lcom/android/billingclient/api/Purchase;",                          "gplay"),
+        (r"Lcom/android/billingclient/api/BillingResult;",                     "gplay"),
+        (r"Lcom/android/billingclient/api/QueryProductDetailsParams;",         "gplay"),
+        (r"Lcom/android/billingclient/api/BillingClient\$Builder;",           "gplay"),
+        (r"Lcom/android/billingclient/api/AcknowledgePurchaseParams;",         "gplay"),
+        (r"->launchBillingFlow",                                               "gplay"),
+        (r"->queryProductDetailsAsync",                                        "gplay"),
+        (r"->acknowledgePurchase",                                             "gplay"),
+        (r"->consumeAsync",                                                    "gplay"),
+        (r"->startConnection",                                                 "gplay"),
+        (r"->isReady\(\)",                                                    "gplay"),
+        (r"->endConnection",                                                   "gplay"),
+        (r"->queryPurchasesAsync",                                             "gplay"),
+        # ── Google Pay (wallet / payment token API) ───────────────────────────
+        (r"Lcom/google/android/gms/wallet/",                                   "gpay"),
+        (r"Lcom/google/android/gms/wallet/PaymentsClient;",                    "gpay"),
+        (r"Lcom/google/android/gms/wallet/IsReadyToPayRequest;",               "gpay"),
+        (r"Lcom/google/android/gms/wallet/PaymentDataRequest;",                "gpay"),
+        (r"->isReadyToPay\(",                                                  "gpay"),
+        (r"->loadPaymentData\(",                                               "gpay"),
+        # ── Subscriptions v6+ ─────────────────────────────────────────────────
+        (r"Lcom/android/billingclient/api/SubscriptionUpdateParams;",          "gplay_v6"),
+        (r"Lcom/android/billingclient/api/ProductDetailsResponseListener;",    "gplay_v6"),
+        (r"Lcom/android/billingclient/api/PurchasesResponseListener;",         "gplay_v6"),
+        # ── Amazon ───────────────────────────────────────────────────────────
+        (r"Lcom/amazon/device/iap/PurchasingService;",                         "amazon"),
+        (r"Lcom/amazon/device/iap/model/Receipt;",                             "amazon"),
+        (r"Lcom/amazon/device/iap/PurchasingListener;",                        "amazon"),
+        # ── Huawei ────────────────────────────────────────────────────────────
+        (r"Lcom/huawei/hms/iap/IapClient;",                                    "huawei"),
+        (r"Lcom/huawei/hms/iap/entity/InAppPurchaseData;",                     "huawei"),
+        # ── Samsung / OneStore ────────────────────────────────────────────────
+        (r"Lcom/samsung/android/iap/",                                         "samsung"),
+        (r"Lcom/onestore/iap/",                                                "onestore"),
+        # ── Generic premium gate methods ─────────────────────────────────────
+        (r"isPremium|isSubscribed|hasPurchased|isPurchased",                   "generic"),
+        (r"isEntitled|isLicensed|isPaid|isVip|isMember|isUnlocked",            "generic"),
+        (r"PURCHASE_STATE_PURCHASED|purchaseState|purchaseToken",              "generic"),
+        (r"purchase|billing|ProductDetails|SKU_DETAILS",                       "generic"),
+        # ── BillingClientStateListener callbacks ─────────────────────────────
+        (r"Lcom/android/billingclient/api/BillingClientStateListener;",        "billing_state"),
+        (r"onBillingSetupFinished",                                             "billing_state"),
+        (r"onBillingServiceDisconnected",                                       "billing_state"),
+        # ── Unity billing bridge (WebViewStoreEventListener) ──────────────────
+        # These files contain the if-ne gates that route to C# success/error.
+        # Patching them makes the WebView receive PURCHASES_UPDATED_RESULT
+        # regardless of what the billing result code actually was.
+        (r"Lcom/unity3d/services/store/WebViewStoreEventListener;",            "unity_bridge"),
+        (r"PURCHASES_UPDATED_RESULT|PURCHASES_UPDATED_ERROR",                  "unity_bridge"),
+        (r"StoreWebViewEventSender",                                            "unity_bridge"),
+        (r"Lcom/unity3d/services/store/gpbl/bridges/BillingResultBridge;",     "unity_bridge"),
+        # ── BillingResult class – contains getResponseCode() ──────────────────
+        (r"\.class.*Lcom/android/billingclient/api/BillingResult;",           "billing_result"),
+        (r"getResponseCode\(\)I",                                             "billing_result"),
+        (r"Lcom/android/billingclient/api/BillingResult;",                     "billing_result"),
+        # ── ServiceConnection files – intercept binder injection point ────────
+        # Files calling IInAppBillingService$Stub.asInterface() are where the
+        # real Play Store binder is received. We replace it with FakeIAP binder.
+        (r"IInAppBillingService.*asInterface",                                  "svc_conn"),
+        (r"Lcom/android/vending/billing/IInAppBillingService",                 "svc_conn"),
+        # ── Purchase state / acknowledgement ──────────────────────────────────
+        (r"->getPurchaseState\(\)",                                            "purchase_state"),
+        (r"getPurchaseState|PURCHASE_STATE_PURCHASED|PURCHASED",               "purchase_state"),
+        (r"->isAcknowledged\(\)",                                             "purchase_state"),
     ]
     INTEGRITY_PATTERNS = [
+        # ── Play Integrity API ────────────────────────────────────────────────
         (r"Lcom/google/android/play/core/integrity/IntegrityManager;",           "play_int"),
         (r"Lcom/google/android/play/core/integrity/IntegrityTokenResponse;",     "play_int"),
-        (r"->requestIntegrityToken",                                              "play_int"),
         (r"Lcom/google/android/play/core/integrity/StandardIntegrityManager;",   "play_int"),
+        (r"Lcom/google/android/play/core/integrity/StandardIntegrityToken;",     "play_int"),
+        (r"->requestIntegrityToken",                                              "play_int"),
+        (r"->requestAndShowDialog",                                              "play_int"),
+        # ── SafetyNet (deprecated but still widely used) ──────────────────────
         (r"Lcom/google/android/gms/safetynet/SafetyNet;",                        "safetynet"),
+        (r"Lcom/google/android/gms/safetynet/SafetyNetApi;",                     "safetynet"),
         (r"->attest\(",                                                           "safetynet"),
+        # ── Android Vending LVL (classic) ────────────────────────────────────
         (r"Lcom/android/vending/licensing/LicenseChecker;",                      "lvl"),
         (r"Lcom/android/vending/licensing/LicenseValidator;",                    "lvl"),
-        (r"->getPackageManager",                                                  "sig"),
+        (r"Lcom/google/android/vending/licensing/",                              "lvl2"),
+        # ── PairIP (most common Unity game license system) ────────────────────
+        (r"Lcom/pairip/licensecheck/LicenseClient;",                             "pairip"),
+        (r"Lcom/pairip/licensecheck/LicenseActivity;",                           "pairip"),
+        (r"Lcom/pairip/licensecheck/LicenseContentProvider;",                    "pairip"),
+        (r"com/pairip/licensecheck",                                              "pairip"),
+        (r"initializeLicenseCheck|scheduleRepeatedLicenseCheck|"
+         r"reportSuccessfulLicenseCheck|populateInputDataForLicenseCheck",        "pairip"),
+        # ── Kiwi Security ────────────────────────────────────────────────────
+        (r"Lcom/kiwi/security/",                                                 "kiwi"),
+        # ── AppSealing / DexProtector ─────────────────────────────────────────
+        (r"Lcom/inka/android/appsealing/",                                       "appsealing"),
+        (r"com/dexprotector/",                                                    "dexprotector"),
+        # ── Signature / installer / package checks ────────────────────────────
         (r"->getPackageInfo",                                                     "sig"),
         (r"->signatures",                                                         "sig"),
         (r"->getInstallerPackageName",                                            "sig"),
+        (r"->getInstallerPackageNameCompat",                                      "sig"),
+        (r"->getSigningInfo",                                                     "sig"),
+        (r"->signingInfo",                                                        "sig"),
+        # ── Anti-tamper patterns ──────────────────────────────────────────────
         (r"isDatabaseIntegrityOk",                                               "dbint"),
         (r"WEBVIEW_MEDIA_INTEGRITY",                                             "wvint"),
         (r"checkValidity|verifyPurchase|validateReceipt|checkAppIntegrity",      "custom"),
+        (r"tamperDetect|rootDetect|isRooted|isDebuggable",                       "antitamper"),
+        # ── Subscription management SDKs (often gate features) ───────────────
+        (r"Lcom/revenuecat/purchases/",                                          "revenuecat"),
+        (r"Lcom/qonversion/android/sdk/",                                        "qonversion"),
+        (r"Lio/adapty/sdk/",                                                     "adapty"),
+        (r"Lcom/chargebee/android/",                                             "chargebee"),
+        (r"Lcom/google/android/play/core/review/",                               "play_review"),
     ]
     STORAGE_PATTERNS = [
         (r"Landroid/database/sqlite/SQLiteDatabase;->rawQuery\(",                 "sqlite"),
@@ -660,15 +1199,29 @@ class PatchEngine:
         (r"isPremium|isUnlocked|premium_user|subscription_active|has_purchased",  "flag"),
     ]
     SERVER_PATTERNS = [
+        # ── JSON parsing ─────────────────────────────────────────────────────
         (r"Lorg/json/JSONObject;->(?:getInt|optInt)\(",                           "json"),
         (r"Lorg/json/JSONObject;->(?:getBoolean|optBoolean)\(",                  "json"),
         (r"Lorg/json/JSONObject;->(?:getString|optString)\(",                    "json"),
+        (r"Lorg/json/JSONObject;->(?:getLong|optLong)\(",                        "json"),
+        (r"Lorg/json/JSONArray;->length\(",                                      "json"),
+        # ── Retrofit2 ────────────────────────────────────────────────────────
         (r"Lretrofit2/Response;->(?:code|isSuccessful)\(",                       "retrofit"),
+        (r"Lretrofit2/Call;->execute\(",                                         "retrofit"),
+        # ── OkHttp3 ──────────────────────────────────────────────────────────
         (r"Lokhttp3/Response;->(?:code|isSuccessful)\(",                         "okhttp"),
+        (r"Lokhttp3/ResponseBody;->string\(",                                    "okhttp"),
+        # ── Ktor ─────────────────────────────────────────────────────────────
+        (r"Lio/ktor/client/statement/HttpResponse;",                              "ktor"),
+        # ── Volley ───────────────────────────────────────────────────────────
+        (r"Lcom/android/volley/Response\$Listener;",                             "volley"),
+        # ── Generic status keys ───────────────────────────────────────────────
         (r"purchaseState|statusCode|status_code|result_code|"
          r"resultCode|errorCode|error_code|responseCode",                         "status"),
-        (r'"status"|"code"|"result"|"success"|"active"|"subscribed"',            "json_key"),
-        (r"Ljava/net/HttpURLConnection;->getResponseCode\(",                      "urlconn"),
+        (r'"status"|"code"|"result"|"success"|"active"|"subscribed"',           "json_key"),
+        (r'"premium"|"isPremium"|"licensed"|"valid"|"verified"',                "json_key"),
+        # ── HttpURLConnection ─────────────────────────────────────────────────
+        (r"Ljava/net/HttpURLConnection;->getResponseCode\(",                     "urlconn"),
     ]
 
     # ── Ads SDK detection patterns ─────────────────────────────────────────────
@@ -701,6 +1254,19 @@ class PatchEngine:
         (r"AdView|AdRequest|AdListener|AdLoader|AdUnit",                   "generic_ad"),
         (r"->showAd\(|->showInterstitial\(|->showRewarded\(",           "generic_ad"),
         (r"->loadBannerAd\(|->loadRewardedAd\(|->loadNativeAd\(",      "generic_ad"),
+        # ── Additional ad networks ────────────────────────────────────────────
+        (r"Lcom/pubmatic/sdk/",                                            "pubmatic"),
+        (r"Lcom/mintegral/",                                               "mintegral"),
+        (r"Lcom/tradplus/",                                                "tradplus"),
+        (r"Lcom/bidmachine/",                                              "bidmachine"),
+        (r"Lai/admost/",                                                   "admost"),
+        (r"Lnet/sourceforge/openads/",                                     "openads"),
+        (r"Lcom/my/target/",                                               "mytarget"),
+        (r"Lru/mail/",                                                     "vk_ads"),
+        (r"Lcom/yandex/mobile/ads/",                                       "yandex_ads"),
+        (r"Lbiz/growthcraft/",                                             "startapp"),
+        (r"Lcom/startapp/sdk/",                                            "startapp"),
+        (r"Lcom/inmobi/ads/",                                              "inmobi"),
     ]
 
     # ── Ads method-name regexes ────────────────────────────────────────────────
@@ -732,14 +1298,41 @@ class PatchEngine:
         r"(?:purchase|buy|startPurchase|initPurchase|doPurchase|"
         r"launchPurchase|beginPurchase|onPurchase|processPurchase|"
         r"handlePurchase|completePurchase|triggerPurchase|makePurchase|"
-        r"requestPurchase|launchBillingFlow|buyProduct|orderProduct)\("
+        r"requestPurchase|buyProduct|orderProduct|"
+        r"startPayment|requestPayment|initiatePayment|processPayment|"
+        r"handlePayment|doPayment|startCheckout|"
+        r"processCheckout|submitOrder|doPurchaseFlow)\("
+        # NOTE: launchBillingFlow is intentionally NOT here.
+        # Stubbing it to return null causes NPE when app calls getResponseCode()
+        # on the null result. launchBillingFlow must run normally to show the
+        # Play Store purchase UI. The response is handled by getResponseCode()=OK patch.
     )
     _BOOL_GATE_RE = re.compile(
         r"\.method\s+(?:(?:public|private|protected|static|final)\s+)*"
         r"(?:isPremium|isUnlocked|isPurchased|isSubscribed|hasPurchased|"
         r"checkPremium|isLicensed|isActivated|isProUser|isProVersion|"
         r"isFullVersion|isBought|hasFullAccess|isPaid|isVip|isVIP|"
-        r"isPro|isActive|isMember|hasSubscription|isEntitled)\(\)Z"
+        r"isPro|isActive|isMember|hasSubscription|isEntitled|"
+        r"checkEntitlement|isVipMember|isPremiumUser|hasPremium|"
+        r"isGoldMember|isPremiumMember|canAccess|isFeatureEnabled|"
+        r"isContentUnlocked|hasPurchasedPremium|isReadyToPay|"
+        r"canMakePayment|isBillingSupported|isSubscriptionSupported|"
+        r"isReadyToPay|isBillingReady|isBillingAvailable|"
+        r"isBillingSetupDone|isBillingClientReady)\(\)Z"
+    )
+
+    # Matches getResponseCode()I ONLY in billing-related classes.
+    # Must be combined with a class-name check to avoid patching HTTP
+    # response code getters (WebRequest.getResponseCode, HttpURLConnection, etc.)
+    _BILLING_RESULT_GETTER_RE = re.compile(
+        r"\.method\s+(?:(?:public|private|protected|static|final)\s+)*"
+        r"getResponseCode\(\)I"
+    )
+    # Class names that legitimately contain billing response codes
+    _BILLING_CLASS_RE = re.compile(
+        r"(?:BillingResult|BillingResponse|BillingStatus|InAppMessage|"
+        r"BillingResultResponse|com/android/billingclient)",
+        re.IGNORECASE
     )
 
     # FIX: Scoped integrity regex – requires class context before onFailure
@@ -749,7 +1342,16 @@ class PatchEngine:
         r"(?:requestIntegrityToken|attest|checkLicense|verifySignature|"
         r"checkSignature|checkAppIntegrity|validateIntegrity|"
         r"handleIntegrityResult|processIntegrityToken|verifyInstall|"
-        r"validateToken|verifyDevice)\("
+        r"validateToken|verifyDevice|"
+        r"initializeLicenseCheck|scheduleRepeatedLicenseCheck|"
+        r"reportSuccessfulLicenseCheck|populateInputDataForLicenseCheck|"
+        r"checkLicenseInternal)\("
+    )
+    # Detect PairIP class presence in file – if found, stub ALL non-abstract methods
+    _PAIRIP_CLASS_RE = re.compile(
+        r"Lcom/pairip/licensecheck/(?:LicenseClient|LicenseActivity|"
+        r"LicenseContentProvider|LicenseResponseHelper|RepeatedCheckMetadata);",
+        re.IGNORECASE,
     )
     # Separate regex for onFailure – requires integrity parent class context
     _INTEGRITY_ONFAILURE_RE = re.compile(
@@ -759,7 +1361,9 @@ class PatchEngine:
     # Class-level context that qualifies onFailure as integrity-related
     _INTEGRITY_CLASS_CONTEXT_RE = re.compile(
         r"(?:IntegrityManager|SafetyNet|LicenseChecker|IntegrityToken|"
-        r"LicenseValidator|checkIntegrity|onIntegrity)",
+        r"LicenseValidator|checkIntegrity|onIntegrity|"
+        r"pairip|licensecheck|LicenseClient|LicenseActivity|"
+        r"initializeLicenseCheck|scheduleRepeatedLicenseCheck)",
         re.IGNORECASE,
     )
 
@@ -775,13 +1379,30 @@ class PatchEngine:
         self._ads: set[str] = set()
 
     # ── Detection ─────────────────────────────────────────────────────────────
-    def find_all(self):
-        log("head", "Detection Phase")
+    def find_all(self, needed: frozenset | None = None):
+        """
+        Scan smali files for API patterns.
+
+        Parameters
+        ----------
+        needed : frozenset of category names to scan (iap, integrity, ads,
+                 storageIO, serverIO).  Pass None to scan ALL (e.g. detect-only
+                 mode).  Scanning only needed categories saves minutes on large
+                 APKs – no point scanning 6 000 ads files when patching
+                 integrity only.
+        """
+        log("head", "API Detection")
         t0 = time.time()
-        all_pats = (self.IAP_PATTERNS + self.INTEGRITY_PATTERNS
-                    + self.STORAGE_PATTERNS + self.SERVER_PATTERNS
-                    + self.ADS_PATTERNS)
-        res = self.scanner.scan(all_pats, label="API pattern scan")
+        scan_all = needed is None
+
+        cat_pats: list[tuple] = []
+        if scan_all or "iap"       in needed: cat_pats += self.IAP_PATTERNS
+        if scan_all or "integrity" in needed: cat_pats += self.INTEGRITY_PATTERNS
+        if scan_all or "storageIO" in needed: cat_pats += self.STORAGE_PATTERNS
+        if scan_all or "serverIO"  in needed: cat_pats += self.SERVER_PATTERNS
+        if scan_all or "ads"       in needed: cat_pats += self.ADS_PATTERNS
+
+        res = self.scanner.scan(cat_pats, label="API pattern scan")
 
         iap_t = {t for _, t in self.IAP_PATTERNS}
         int_t = {t for _, t in self.INTEGRITY_PATTERNS}
@@ -797,80 +1418,430 @@ class PatchEngine:
                 if tag in srv_t: self._srv.add(f)
                 if tag in ads_t: self._ads.add(f)
 
-        log("ok", f"IAP files       : {C.BD}{len(self._iap)}{C.RS}")
-        log("ok", f"Integrity files : {C.BD}{len(self._int)}{C.RS}")
-        log("ok", f"Ads files       : {C.BD}{len(self._ads)}{C.RS}")
-        log("ok", f"Storage files   : {C.BD}{len(self._sto)}{C.RS}")
-        log("ok", f"Server-reply    : {C.BD}{len(self._srv)}{C.RS}")
+        if scan_all or "iap"       in (needed or set()):
+            log("ok", f"IAP files       : {C.BD}{len(self._iap)}{C.RS}")
+        if scan_all or "integrity" in (needed or set()):
+            log("ok", f"Integrity files : {C.BD}{len(self._int)}{C.RS}")
+        if scan_all or "ads"       in (needed or set()):
+            log("ok", f"Ads files       : {C.BD}{len(self._ads)}{C.RS}")
+        if scan_all or "storageIO" in (needed or set()):
+            log("ok", f"Storage files   : {C.BD}{len(self._sto)}{C.RS}")
+        if scan_all or "serverIO"  in (needed or set()):
+            log("ok", f"Server-reply    : {C.BD}{len(self._srv)}{C.RS}")
         log("ok", f"Scan time       : {time.time()-t0:.1f}s")
 
     # ── IAP patching ──────────────────────────────────────────────────────────
     def patch_iap(self) -> int:
         if not self._iap:
             log("warn", "No IAP files – skip."); return 0
+        # Write the fake IAP binder smali class into the tree FIRST.
+        # _patch_iap_file will then inject calls to FakeIAP.getInstance()
+        # in ServiceConnection files, so FakeIAP must exist before rebuild.
+        self._write_fake_iap_smali()
         log("info", f"Patching IAP ({len(self._iap)} files)…")
-        # FIX: parallel file-level patching
         total = self._patch_parallel(self._iap, self._patch_iap_file, "iap")
         log("ok",  f"IAP: {C.G}{total}{C.RS} patches applied.")
         return total
 
     def _patch_iap_file(self, rel: str) -> int:
+        """
+        Patch IAP-related smali using SmaliAST for structural decisions:
+          - Method boundaries from AST (not raw .method/.end method regex)
+          - Return type from AST descriptor (no regex false positives)
+          - BillingResponseCode inline patch still uses line-scan (single invoke)
+
+        Regex is only used for PATTERN MATCHING (what the method does), not
+        for structural parsing (where it is / what type it returns).
+        """
         path = os.path.join(self.base, rel)
-        try:    lines = open(path, encoding="utf-8").readlines()
-        except: return 0
+        cls  = parse_smali(path)
+        if cls is None:
+            return 0
+        lines   = cls.source_lines
         patched = 0
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].rstrip()
+        # Track line-index shifts caused by body insertions
+        # (AST line numbers are valid at parse time; we work top-to-bottom
+        #  so shift only accumulates forward)
+        shift = 0
 
-            # ── Purchase method: replace body with fake success ───────────────
-            if self._PURCHASE_RE.search(stripped):
-                if any(m in stripped for m in (' abstract',' native',' bridge')):
-                    i += 1; continue
-                end = _method_end(lines, i)
-                if end is None: i += 1; continue
-                cb  = self._find_callback(lines, i, end)
-                nb  = self._iap_success_body(cb)
-                lines = _safe_replace_body(lines, i, end, nb, locals_n=1, tag="iap:purchase-stub")
-                patched += 1
-                _REPORT.add("iap", rel, i, "purchase_method_stub")
-                log("patch", f"IAP purchase  {rel}  L{i}", indent=1)
-                i += 1 + 1 + len(nb)
+        for method in cls.methods:
+            if method.is_abstract or method.is_native:
+                continue
+            s  = method.declaration   # method declaration line (AST-parsed)
+            ms = method.line_start + shift
+            me = method.line_end   + shift
+
+            # Bounds-guard: shift arithmetic must never produce out-of-range indices
+            if ms < 0 or me >= len(lines) or ms > me:
                 continue
 
-            # ── Boolean gate: isPremium() → return true ───────────────────────
-            if self._BOOL_GATE_RE.search(stripped):
-                if any(m in stripped for m in (' abstract',' native',' bridge')):
-                    i += 1; continue
-                end = _method_end(lines, i)
-                if end is None: i += 1; continue
+            # ── Google Pay: isReadyToPay → force true ────────────────────────
+            if re.search(r"->isReadyToPay\(", s) and re.search(r"\)Z$", s):
                 nb  = ["    const/4 v0, 0x1\n", "    return v0\n"]
-                lines = _safe_replace_body(lines, i, end, nb, locals_n=1, tag="iap:bool-gate→true")
+                old_len = me - ms + 1
+                lines   = _safe_replace_body(lines, ms, me, nb,
+                                             locals_n=1, tag="iap:gpay-ready→true")
+                shift  += (1 + 1 + 1 + len(nb) + 1) - old_len
                 patched += 1
-                _REPORT.add("iap", rel, i, "bool_gate_true")
-                log("patch", f"IAP bool gate  {rel}  L{i}", indent=1)
-                i += 1 + 1 + len(nb)
+                _REPORT.add("iap", rel, ms, "gpay_ready_true")
+                log("patch", f"GPay isReadyToPay→true  {rel}  L{ms}", indent=1)
                 continue
+
+            # ── Google Pay: loadPaymentData → stub void ────────────────────
+            if re.search(r"->loadPaymentData\(", s) and re.search(r"\)V$", s):
+                nb  = ["    return-void\n"]
+                old_len = me - ms + 1
+                lines   = _safe_replace_body(lines, ms, me, nb,
+                                             locals_n=0, tag="iap:gpay-load-stub")
+                shift  += (1 + 1 + 1 + len(nb) + 1) - old_len
+                patched += 1
+                _REPORT.add("iap", rel, ms, "gpay_load_stub")
+                log("patch", f"GPay loadPaymentData stub  {rel}  L{ms}", indent=1)
+                continue
+
+            # ── Purchase method: replace body with fake-success stub ──────────
+            if self._PURCHASE_RE.search(s):
+                cb  = self._find_callback(lines, ms, me)
+                # Use correct return type: most purchase methods are void,
+                # but launchBillingFlow returns BillingResult (an object).
+                # Using return-void in a non-void method causes Dalvik verifier
+                # to reject the class at runtime.
+                nb  = self._iap_success_body(cb, method)
+                loc = 1  # .locals 1 (v0 used for const-string or null)
+                old_len = me - ms + 1
+                lines   = _safe_replace_body(lines, ms, me, nb,
+                                             locals_n=loc, tag="iap:purchase-stub")
+                new_len = 1 + 1 + 1 + len(nb) + 1
+                shift  += new_len - old_len
+                patched += 1
+                _REPORT.add("iap", rel, ms, "purchase_method_stub")
+                log("patch", f"IAP purchase  {rel}  L{ms}", indent=1)
+                continue
+
+            # ── launchBillingFlow → direct success callback ──────────────────
+            # Replaces the Play Store dialog with an instant success:
+            # Gets OK BillingResult from zzcj.zzf, then calls
+            # PurchasesUpdatedListener.onPurchasesUpdated(OK, []) directly.
+            # Path: BillingClientImpl.zzf (zzs) → zzs.zzb (listener)
+            if (method.name == "launchBillingFlow"
+                    and "BillingFlowParams" in (method.descriptor or "")
+                    and "BillingResult" in (method.return_type or "")):
+                if not (method.is_abstract or method.is_native):
+                    # Return pre-built OK BillingResult (zzcj.zzf has code=0).
+                    # Also call onPurchasesUpdated(OK, emptyList) so the app's
+                    # purchase listener fires immediately without Play Store dialog.
+                    # Build JSON string for fake Purchase - escape " as \" for smali
+                    _pj = ('{"orderId":"UG.bypass","packageName":"com.ug",'
+                           '"productIds":["bypass"],"purchaseState":0,'
+                           '"purchaseToken":"ug_token_bypass","acknowledged":true}')
+                    _pj_s = _pj.replace('"', '\\\"'  )   # " → \" in smali
+                    nb = [
+                        "    sget-object v0, Lcom/android/billingclient/api/zzcj;"
+                        "->zzf:Lcom/android/billingclient/api/BillingResult;\n",
+                        "    iget-object v1, p0, Lcom/android/billingclient/api/BillingClientImpl;"
+                        "->zzf:Lcom/android/billingclient/api/zzs;\n",
+                        "    if-eqz v1, :ug_ret\n",
+                        "    iget-object v1, v1, Lcom/android/billingclient/api/zzs;"
+                        "->zzb:Lcom/android/billingclient/api/PurchasesUpdatedListener;\n",
+                        "    if-eqz v1, :ug_ret\n",
+                        "    new-instance v2, Ljava/util/ArrayList;\n",
+                        "    invoke-direct {v2}, Ljava/util/ArrayList;-><init>()V\n",
+                        "    new-instance v3, Lcom/android/billingclient/api/Purchase;\n",
+                        f'    const-string v4, "{_pj_s}"\n',
+                        '    const-string v5, ""\n',
+                        "    invoke-direct {v3, v4, v5}, Lcom/android/billingclient/api/Purchase;"
+                        "-><init>(Ljava/lang/String;Ljava/lang/String;)V\n",
+                        "    invoke-virtual {v2, v3}, Ljava/util/ArrayList;->add(Ljava/lang/Object;)Z\n",
+                        "    invoke-interface {v1, v0, v2}, Lcom/android/billingclient/api/"
+                        "PurchasesUpdatedListener;->onPurchasesUpdated("
+                        "Lcom/android/billingclient/api/BillingResult;Ljava/util/List;)V\n",
+                        "    :ug_ret\n",
+                        "    return-object v0\n",
+                    ]
+                    old_len = me - ms + 1
+                    lines   = _safe_replace_body(lines, ms, me, nb, locals_n=6,
+                                                 tag="iap:launchBillingFlow-direct")
+                    new_len = 1 + 1 + 1 + len(nb) + 1
+                    shift  += new_len - old_len
+                    patched += 1
+                    _REPORT.add("iap", rel, ms, "launch_billing_flow_direct")
+                    log("patch", f"launchBillingFlow→direct  {rel}  L{ms}", indent=1)
+                    continue
+
+            # ── BillingResult.getResponseCode()I → return 0 (OK) ─────────────
+            # Only stub getResponseCode() when the class IS a billing class.
+            # Class-name guard prevents patching HTTP/WebRequest response codes
+            # which would break all network communication in the app.
+            if (self._BILLING_RESULT_GETTER_RE.search(s)
+                    and self._BILLING_CLASS_RE.search(cls.class_name + " " + cls.super_name)):
+                if not (method.is_abstract or method.is_native):
+                    nb  = ["    const/4 v0, 0x0\n", "    return v0\n"]
+                    old_len = me - ms + 1
+                    lines   = _safe_replace_body(lines, ms, me, nb, locals_n=1,
+                                                 tag="iap:getResponseCode=OK")
+                    new_len = 1 + 1 + 1 + len(nb) + 1
+                    shift  += new_len - old_len
+                    patched += 1
+                    _REPORT.add("iap", rel, ms, "billing_response_code_ok")
+                    log("patch",
+                        f"getResponseCode→0(OK)  {rel}  L{ms}",
+                        indent=1)
+                    continue
+
+            # ── queryPurchasesAsync stub → onQueryPurchasesResponse(OK, []) ─────
+            # Called on app startup to restore owned purchases.
+            # Stub to return OK + empty list so the app doesn't hang.
+            # NOTE: empty list = no existing purchases shown at startup.
+            # Real unlocking happens via isPremium() bool-gate patches.
+            if method.name == "queryPurchasesAsync":
+                if not (method.is_abstract or method.is_native):
+                    # Method sig: queryPurchasesAsync(QueryPurchasesParams, PurchasesResponseListener)V
+                    # p2 = PurchasesResponseListener
+                    if method.descriptor and "PurchasesResponseListener" in method.descriptor:
+                        nb = [
+                            "    sget-object v0, Lcom/android/billingclient/api/zzcj;"
+                            "->zzf:Lcom/android/billingclient/api/BillingResult;\n",
+                            "    new-instance v1, Ljava/util/ArrayList;\n",
+                            "    invoke-direct {v1}, Ljava/util/ArrayList;-><init>()V\n",
+                            "    invoke-interface {p2, v0, v1}, Lcom/android/billingclient/api/"
+                            "PurchasesResponseListener;->onQueryPurchasesResponse("
+                            "Lcom/android/billingclient/api/BillingResult;Ljava/util/List;)V\n",
+                            "    return-void\n",
+                        ]
+                        old_len = me - ms + 1
+                        lines   = _safe_replace_body(lines, ms, me, nb, locals_n=2,
+                                                     tag="iap:queryPurchasesAsync-ok")
+                        new_len = 1 + 1 + 1 + len(nb) + 1
+                        shift  += new_len - old_len
+                        patched += 1
+                        _REPORT.add("iap", rel, ms, "query_purchases_ok")
+                        log("patch", f"queryPurchasesAsync→OK  {rel}  L{ms}", indent=1)
+                        continue
+
+            # ── isAcknowledged()Z → return true ──────────────────────────────
+            # Purchase.isAcknowledged() must return true or Play considers the
+            # purchase pending and shows it as unconfirmed.
+            if re.search(r"\.method\s+[^(]*isAcknowledged\(\)Z", s):
+                if not (method.is_abstract or method.is_native):
+                    nb = ["    const/4 v0, 0x1\n", "    return v0\n"]
+                    old_len = me - ms + 1
+                    lines   = _safe_replace_body(lines, ms, me, nb, locals_n=1,
+                                                 tag="iap:isAcknowledged→true")
+                    new_len = 1 + 1 + 1 + len(nb) + 1
+                    shift  += new_len - old_len
+                    patched += 1
+                    _REPORT.add("iap", rel, ms, "is_acknowledged_true")
+                    log("patch", f"isAcknowledged→true  {rel}  L{ms}", indent=1)
+                    continue
+
+            # ── IInAppBillingService.Stub.asInterface() → inject FakeIAP ─────────
+            # When the billing library's ServiceConnection.onServiceConnected()
+            # receives the IBinder from Play Store, it calls asInterface(binder)
+            # to wrap it. We replace the binder with FakeIAP.getInstance()
+            # BEFORE asInterface() is called. This redirects ALL billing AIDL
+            # calls through our fake service instead of Play Store.
+            #
+            # Pattern: invoke-static {regN}, Lcom/android/vending/billing/
+            #              IInAppBillingService$Stub;->asInterface(...)
+            for instr in method.instrs:
+                if ("IInAppBillingService" in instr.raw and
+                        "asInterface" in instr.raw and
+                        "invoke-static" in instr.raw):
+                    ln = instr.line_no + shift
+                    if 0 <= ln < len(lines):
+                        # Extract the register passed to asInterface
+                        m2 = re.search(r"invoke-static\s+\{([vp]\d+)\}", lines[ln])
+                        if m2:
+                            reg = m2.group(1)
+                            try:
+                                rn = int(reg[1:])
+                                if rn <= 15:
+                                    # Replace the binder with our fake one
+                                    inject = (
+                                        f"    invoke-static {{}}, Lcom/ug/iap/FakeIAP;"
+                                        f"->getInstance()Lcom/ug/iap/FakeIAP;"
+                                        f"  # UNGUARD: fake-iap-binder\n"
+                                        f"    move-result-object {reg}\n"
+                                    )
+                                    lines.insert(ln, inject)
+                                    shift += 1
+                                    patched += 1
+                                    _REPORT.add("iap", rel, ln, "fake_iap_binder")
+                                    log("patch",
+                                        f"FakeIAP binder injected  {rel}  L{ln}",
+                                        indent=1)
+                            except (ValueError, IndexError):
+                                pass
+                    break
+
+            # ── Boolean gate: isPremium()Z → return true ──────────────────────
+            if self._BOOL_GATE_RE.search(s):
+                nb  = ["    const/4 v0, 0x1\n", "    return v0\n"]
+                old_len = me - ms + 1
+                lines   = _safe_replace_body(lines, ms, me, nb,
+                                             locals_n=1, tag="iap:bool-gate→true")
+                new_len = 1 + 1 + 1 + len(nb) + 1
+                shift  += new_len - old_len
+                patched += 1
+                _REPORT.add("iap", rel, ms, "bool_gate_true")
+                log("patch", f"IAP bool gate  {rel}  L{ms}", indent=1)
+                continue
+
+            # ── Google Pay: isReadyToPay / canMakePayment → true ─────────────
+            # These are called as Task<Boolean> – the boolean result matters
+            # The BOOL_GATE_RE already handles methods NAMED isReadyToPay()Z
+            # This handles the inline Task result extraction pattern:
+            #   invoke-virtual {vX}, Lcom/google/android/gms/tasks/Task;->getResult()
+            for instr in method.instrs:
+                if ("getResult()Ljava/lang/Object;" in instr.raw
+                        and "Task;" in instr.raw
+                        and "invoke-virtual" in instr.raw):
+                    ln = instr.line_no + shift
+                    if 0 <= ln < len(lines):
+                        # Look ahead for Boolean.booleanValue() unbox
+                        for k in range(ln+1, min(ln+8, len(lines))):
+                            if ("Boolean;->booleanValue()Z" in lines[k]
+                                    and "invoke-virtual" in lines[k]):
+                                j = _next_move_result_idx(lines, k)
+                                if j and 0 <= j < len(lines):
+                                    m2 = re.match(r"([ 	]+)(move-result)\s+([vp]\d+)", lines[j])
+                                    if m2:
+                                        reg = m2.group(3)
+                                        try:
+                                            if int(reg[1:]) <= 15:
+                                                lines.insert(j+1, f"    const/4 {reg}, 0x1  # UNGUARD: GPay ready=true\n")
+                                                shift += 1
+                                                patched += 1
+                                                _REPORT.add("iap", rel, j, "gpay_ready_true")
+                                        except (ValueError, IndexError):
+                                            pass
+                                break
+                    break
+
+            # ── Unity WebViewStoreEventListener gate patch ────────────────────
+            # onPurchaseUpdated and onBillingSetupFinished both have this gate:
+            #   getResponseCode() → compare to OK → if-ne → error path
+            # We patch the if-ne to goto the success label directly.
+            # This makes Unity's WebView always receive the success event,
+            # bypassing the response code check entirely.
+            if method.name in ("onPurchaseUpdated", "onBillingSetupFinished",
+                               "onPurchaseResponse"):
+                # Find the if-ne that gates on BillingResultResponseCode.OK
+                for instr in method.instrs:
+                    if instr.opcode not in ("if-ne", "if-eq"):
+                        continue
+                    ln = instr.line_no + shift
+                    if 0 <= ln < len(lines):
+                        line = lines[ln]
+                        # Pattern: if-ne vX, vY, :cond_N
+                        # We want the one after a BillingResultResponseCode compare
+                        # Look back a few lines for the sget-object BillingResultResponseCode;->OK
+                        lookback = "\n".join(lines[max(0, ln-5):ln])
+                        if ("BillingResultResponseCode" in lookback or
+                                "PURCHASES_UPDATED" in lookback or
+                                "INITIALIZATION_REQUEST" in lookback):
+                            m2 = re.match(
+                                r"([ \t]+)if-(?:ne|eq)\s+\w+,\s+\w+,\s+(:cond_\w+)",
+                                line)
+                            if m2:
+                                indent = m2.group(1)
+                                error_label = m2.group(2)
+                                # Replace if-ne (jump to error) with nop
+                                # → execution falls through to success path
+                                lines[ln] = f"{indent}nop  # UNGUARD: unity-gate-bypass\n"
+                                shift += 0  # same line count
+                                patched += 1
+                                _REPORT.add("iap", rel, ln, "unity_gate_bypass")
+                                log("patch",
+                                    f"Unity gate bypass  {rel}  L{ln}  ({method.name})",
+                                    indent=1)
+                                break
+
+            # ── getPurchaseState() → 1 (PURCHASED) inline ────────────────────
+            # Intercept the result of Purchase.getPurchaseState() and force it
+            # to PURCHASED (1) so all ownership checks pass.
+            for instr in method.instrs:
+                ln = instr.line_no + shift
+                if 0 <= ln < len(lines):
+                    if ("->getPurchaseState()I" in instr.raw
+                            and "invoke-virtual" in instr.raw):
+                        j = _next_move_result_idx(lines, ln)
+                        if j is not None:
+                            m2 = re.match(r"([ \t]+)(move-result)\s+([vp]\d+)", lines[j])
+                            if m2:
+                                reg = m2.group(3)
+                                try:
+                                    if int(reg[1:]) <= 15:
+                                        lines.insert(j + 1,
+                                            f"    const/4 {reg}, 0x1"
+                                            f"  # UNGUARD: purchaseState=PURCHASED\n")
+                                        shift += 1
+                                        patched += 1
+                                        _REPORT.add("iap", rel, j, "purchase_state_purchased")
+                                        log("patch",
+                                            f"getPurchaseState→PURCHASED  {rel}  L{j}",
+                                            indent=1)
+                                except (ValueError, IndexError):
+                                    pass
+                        break  # one patch per method for getPurchaseState
+
+            # ── onPurchasesUpdated: force OK response ────────────────────────
+            # Called after launchBillingFlow completes. Force responseCode=0
+            # so the app processes the (fake) purchases list.
+            if method.name == "onPurchasesUpdated":
+                for instr in method.instrs:
+                    ln = instr.line_no + shift
+                    if 0 <= ln < len(lines):
+                        if ("BillingResult;->getResponseCode()I" in instr.raw
+                                and "invoke-virtual" in instr.raw):
+                            j = _next_move_result_idx(lines, ln)
+                            if j is not None:
+                                m2 = re.match(r"([ \t]+)(move-result)\s+([vp]\d+)", lines[j])
+                                if m2:
+                                    reg = m2.group(3)
+                                    try:
+                                        if int(reg[1:]) <= 15:
+                                            lines.insert(j + 1,
+                                                f"    const/4 {reg}, 0x0"
+                                                f"  # UNGUARD: purchasesUpdated=OK\n")
+                                            shift += 1
+                                            patched += 1
+                                            _REPORT.add("iap", rel, j,
+                                                        "purchases_updated_ok")
+                                    except (ValueError, IndexError):
+                                        pass
+                            break
 
             # ── BillingResponseCode → 0 (OK) inline ──────────────────────────
-            if ("BillingResult;->getResponseCode()I" in stripped
-                    and "invoke-virtual" in stripped):
-                end = _method_end(lines, i)
-                j = _next_move_result_idx(lines, i)
-                if j is not None:
-                    m = re.match(r"([ \t]+)(move-result)\s+([vp]\d+)", lines[j])
-                    if m:
-                        reg = m.group(3)
-                        inject_line = (f"    const/4 {reg}, 0x0"
-                                       f"  # UNGUARD: BillingResponseCode=OK\n")
-                        lines.insert(j + 1, inject_line)
-                        if end is not None:
-                            _propagate_register_alias(lines, j + 1, reg, "0x0", end + 1)
-                        patched += 1
-                        _REPORT.add("iap", rel, j, "billing_code_ok")
-                        i = j + 2; continue
-
-            i += 1
+            # Line-scan within this method's current (shifted) body
+            for instr in method.instrs:
+                ln = instr.line_no + shift
+                # Bounds-guard: shift may move ln outside valid range
+                if ln < 0 or ln >= len(lines):
+                    continue
+                if ("BillingResult;->getResponseCode()I" in instr.raw
+                        and "invoke-virtual" in instr.raw):
+                    j = _next_move_result_idx(lines, ln)
+                    if j is not None:
+                        m2 = re.match(r"([ \t]+)(move-result)\s+([vp]\d+)", lines[j])
+                        if m2:
+                            reg = m2.group(3)
+                            # Skip if register > v15 (const/4 is 4-bit only)
+                            try:
+                                if int(reg[1:]) > 15:
+                                    break
+                            except (ValueError, IndexError):
+                                pass
+                            inject = (f"    const/4 {reg}, 0x0"
+                                      f"  # UNGUARD: BillingResponseCode=OK\n")
+                            lines.insert(j + 1, inject)
+                            shift += 1
+                            me_safe = min(me + shift + 1, len(lines))
+                            _propagate_register_alias(
+                                lines, j + 1, reg, "0x0", me_safe)
+                            patched += 1
+                            _REPORT.add("iap", rel, j, "billing_code_ok")
+                    break
 
         if patched:
             _atomic_write(path, lines)
@@ -878,16 +1849,57 @@ class PatchEngine:
         return patched
 
     @staticmethod
-    def _iap_success_body(cb) -> list[str]:
-        json_str = '{"productId":"bypass","purchaseToken":"unguard","purchaseState":1}'
-        body = [f'    const-string v0, "{json_str}"\n']
-        if cb:
-            body.append(f"    invoke-static {{v0}}, {cb[0]}->{cb[1]}(Ljava/lang/String;)V\n")
-        body.append("    return-void\n")
+    def _iap_success_body(cb, method: "SmaliMethod | None" = None) -> list[str]:
+        """
+        Build the stub body for a purchase method.
+
+        Return type logic:
+          V  → return-void          (most purchase flow launchers)
+          L… → return-object v0     (launchBillingFlow → BillingResult, etc.)
+          Z  → const/4 v0, 0x1 + return v0
+          default → return-void (safe fallback)
+
+        The purchase token JSON string is embedded as a const-string with all
+        inner double-quotes escaped as \" so apktool's smali assembler does not
+        misparse the closing delimiter.
+        """
+        raw_json  = '{"productId":"bypass","purchaseToken":"unguard","purchaseState":1}'
+        smali_str = raw_json.replace('"'  , '\\\"'  )   # " → \"  in smali output
+
+        rt = "V"
+        if method is not None:
+            rt = method.return_type or "V"
+
+        if rt == "Z":
+            # boolean return (e.g. isReadyToPay)
+            return ["    const/4 v0, 0x1\n", "    return v0\n"]
+
+        if rt == "V":
+            # void – standard purchase flow: embed JSON token for analytics,
+            # then call the success callback if found, then return void.
+            body = [f'    const-string v0, "{smali_str}"\n']
+            if cb:
+                body.append(f"    invoke-static {{v0}}, {cb[0]}->{cb[1]}(Ljava/lang/String;)V\n")
+            body.append("    return-void\n")
+            return body
+
+        # Non-void, non-boolean: object/int return (launchBillingFlow → BillingResult)
+        # Return null – the caller must handle null BillingResult gracefully.
+        # For BillingResult specifically this is fine because the next call to
+        # getResponseCode() on null will be caught by our BillingResponseCode=0 patch.
+        body = [f'    const-string v0, "{smali_str}"\n', "    const/4 v0, 0x0\n",
+                "    return-object v0\n"]
         return body
 
     @staticmethod
     def _find_callback(lines, start, end):
+        """
+        Search for a static void callback that accepts a single String argument.
+        Used to optionally call success callbacks in purchase stubs.
+        IMPORTANT: the callback invocation is only emitted when the signature
+        matches exactly (L…;→method(Ljava/lang/String;)V). Any other signature
+        would crash at runtime, so we deliberately skip non-matching callbacks.
+        """
         for k in range(start, end):
             m = re.search(
                 r"invoke-static \{[^}]*\}, (L[^;]+;)->([^(]+)\(Ljava/lang/String;\)V",
@@ -905,58 +1917,123 @@ class PatchEngine:
         return total
 
     def _patch_integrity_file(self, rel: str) -> int:
+        """
+        SmaliAST-driven integrity patching:
+         - PairIP detection uses class_name + super_name (no false-positive from
+           string constants or annotation values containing the class name)
+         - Return type comes from method.return_type (descriptor), not regex
+         - Method boundaries are exact (no .end method misalignment)
+         - onFailure scoping uses implements[] and super_name, not line regex
+        """
         path = os.path.join(self.base, rel)
-        try:    lines = open(path, encoding="utf-8").readlines()
-        except: return 0
+        cls  = parse_smali(path)
+        if cls is None:
+            return 0
+        lines   = cls.source_lines
         patched = 0
+        shift   = 0
 
-        # Pre-scan class context for onFailure scope decision
-        full_text = "".join(lines)
-        is_integrity_class = bool(self._INTEGRITY_CLASS_CONTEXT_RE.search(full_text))
+        # AST-level class context checks (reliable: never matches string literals)
+        is_pairip_file = bool(self._PAIRIP_CLASS_RE.search(
+            " ".join([cls.class_name, cls.super_name] + cls.implements)))
+        is_integrity_class = (
+            is_pairip_file or
+            bool(self._INTEGRITY_CLASS_CONTEXT_RE.search(
+                " ".join([cls.class_name, cls.super_name] + cls.implements)))
+        )
+        # Also check if any method DECLARATION (not body) carries integrity names
+        # (catches classes that delegate to integrity APIs without inheriting)
+        if not is_integrity_class:
+            is_integrity_class = any(
+                self._INTEGRITY_CLASS_CONTEXT_RE.search(m.declaration)
+                for m in cls.methods
+            )
+        for method in cls.methods:
+            if method.is_abstract or method.is_native:
+                continue
+            ms = method.line_start + shift
+            me = method.line_end   + shift
+            # Bounds-guard
+            if ms < 0 or me >= len(lines) or ms > me:
+                continue
+            old_len = me - ms + 1
 
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].rstrip()
-
-            # FIX: onFailure is only patched if class has integrity context
-            is_on_failure = (self._INTEGRITY_ONFAILURE_RE.search(stripped)
-                             and is_integrity_class)
-
-            if self._INTEGRITY_RE.search(stripped) or is_on_failure:
-                if any(m in stripped for m in (' abstract',' native',' bridge')):
-                    i += 1; continue
-                end = _method_end(lines, i)
-                if end is None: i += 1; continue
-                ret_m = re.search(r"\)([ZVI]|L[^;]+;)$", stripped)
-                rt    = ret_m.group(1) if ret_m else "V"
-                if rt == "Z":
-                    nb = ["    const/4 v0, 0x1\n", "    return v0\n"]
-                    loc = 1
-                elif rt == "V":
-                    nb  = ["    return-void\n"]
-                    loc = 0
-                else:
-                    nb  = ["    const/4 v0, 0x0\n", "    return-object v0\n"]
-                    loc = 1
-                lines = _safe_replace_body(lines, i, end, nb, loc, tag="integrity:stub")
+            # ── PairIP whole-class: stub every method ─────────────────────────
+            if is_pairip_file:
+                nb, loc = self._stub_for_return_type_ast(method)
+                lines    = _safe_replace_body(lines, ms, me, nb, loc,
+                                              tag="integrity:pairip-stub")
+                new_len  = 1 + 1 + 1 + len(nb) + 1
+                shift   += new_len - old_len
                 patched += 1
-                _REPORT.add("integrity", rel, i, "integrity_stub")
-                log("patch", f"Integrity  {rel}  L{i}", indent=1)
-                i += 1 + 1 + len(nb)
+                _REPORT.add("integrity", rel, ms, "pairip_stub")
+                log("patch", f"PairIP stub  {rel}  L{ms}", indent=1)
                 continue
 
-            # Nop signature checks inline
-            if "->signatures" in stripped or "->getInstallerPackageName" in stripped:
-                lines[i] = f"    # UNGUARD-NOP: {stripped.strip()}\n"
-                _REPORT.add("integrity", rel, i, "sig_check_nop")
-                patched  += 1
+            # ── Named integrity method ─────────────────────────────────────────
+            is_on_failure = (method.name == "onFailure" and is_integrity_class)
+            if (self._INTEGRITY_RE.search(method.declaration) or is_on_failure):
+                nb, loc = self._stub_for_return_type_ast(method)
+                lines    = _safe_replace_body(lines, ms, me, nb, loc,
+                                              tag="integrity:stub")
+                new_len  = 1 + 1 + 1 + len(nb) + 1
+                shift   += new_len - old_len
+                patched += 1
+                _REPORT.add("integrity", rel, ms, "integrity_stub")
+                log("patch", f"Integrity  {rel}  L{ms}", indent=1)
+                continue
 
-            i += 1
+            # ── Inline nop: sig/installer checks inside ANY method ────────────
+            for instr in method.instrs:
+                if ("->signatures" in instr.raw
+                        or "->getInstallerPackageName" in instr.raw
+                        or "->getInstallerPackageNameCompat" in instr.raw):
+                    ln = instr.line_no + shift
+                    lines[ln] = f"    # UNGUARD-NOP: {instr.raw}\n"
+                    _REPORT.add("integrity", rel, ln, "sig_check_nop")
+                    patched += 1
 
         if patched:
             _atomic_write(path, lines)
             _verify_patch(path, expected_min=patched)
         return patched
+
+    @staticmethod
+    def _stub_for_return_type(method_decl: str) -> tuple[list[str], int]:
+        """Return (body_lines, locals_n) stub matching the method return type.
+        Used when we only have the declaration string (legacy/fallback path)."""
+        m = re.search(r"\)([VZBSCFIJD]|\[+[VZBSCFIJD]|\[+L[^;]+;|L[^;]+;)\s*$",
+                      method_decl)
+        rt = m.group(1) if m else "V"
+        if rt == "Z":
+            return ["    const/4 v0, 0x1\n", "    return v0\n"], 1
+        elif rt == "V":
+            return ["    return-void\n"], 0
+        elif rt in ("I", "B", "S", "C", "F"):
+            return ["    const/4 v0, 0x1\n", "    return v0\n"], 1
+        elif rt in ("J", "D"):
+            return ["    const-wide/16 v0, 0x0\n", "    return-wide v0\n"], 2
+        else:
+            return ["    const/4 v0, 0x0\n", "    return-object v0\n"], 1
+
+    @staticmethod
+    def _stub_for_return_type_ast(method: SmaliMethod) -> tuple[list[str], int]:
+        """Return (body_lines, locals_n) using the AST-parsed return type.
+        More reliable than regex on the declaration string: the AST descriptor
+        was parsed from the structured JVM type system, not by matching text."""
+        rt = method.return_type
+        if not rt:
+            rt = "V"
+        if rt == "Z":
+            return ["    const/4 v0, 0x1\n", "    return v0\n"], 1
+        elif rt == "V":
+            return ["    return-void\n"], 0
+        elif rt in ("I", "B", "S", "C", "F"):
+            return ["    const/4 v0, 0x1\n", "    return v0\n"], 1
+        elif rt in ("J", "D"):
+            return ["    const-wide/16 v0, 0x0\n", "    return-wide v0\n"], 2
+        else:  # L…; or [… (object / array) → null
+            return ["    const/4 v0, 0x0\n", "    return-object v0\n"], 1
 
     # ── Storage patching ──────────────────────────────────────────────────────
     def patch_storage(self) -> int:
@@ -989,7 +2066,7 @@ class PatchEngine:
             # SharedPreferences.getBoolean → force true
             if ("SharedPreferences;->getBoolean" in s and "invoke-" in s):
                 reg = _next_move_result(lines, i)
-                if reg:
+                if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                     j = _next_move_result_idx(lines, i)
                     end = _method_end(lines, i)
                     inject = f"    const/4 {reg}, 0x1  # UNGUARD: getBoolean=true\n"
@@ -1002,7 +2079,7 @@ class PatchEngine:
             if ("SharedPreferences;->getInt" in s and "invoke-" in s):
                 if self._near_prem_key(lines, i, lookback=6):
                     reg = _next_move_result(lines, i)
-                    if reg:
+                    if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                         j = _next_move_result_idx(lines, i)
                         end = _method_end(lines, i)
                         inject = f"    const/4 {reg}, 0x1  # UNGUARD: getInt(prem)=1\n"
@@ -1015,7 +2092,7 @@ class PatchEngine:
             if ("Cursor;->getInt(" in s and "invoke-" in s):
                 if self._near_prem_key(lines, i, lookback=8):
                     reg = _next_move_result(lines, i)
-                    if reg:
+                    if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                         j = _next_move_result_idx(lines, i)
                         end = _method_end(lines, i)
                         inject = f"    const/4 {reg}, 0x1  # UNGUARD: cursor.getInt(prem)=1\n"
@@ -1028,7 +2105,7 @@ class PatchEngine:
             if ("Dao;->" in s and "invoke-interface" in s and
                     re.search(r"->(?:isPremium|isUnlocked|getStatus|getSubscription)\(\)", s)):
                 reg = _next_move_result(lines, i)
-                if reg:
+                if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                     j = _next_move_result_idx(lines, i)
                     end = _method_end(lines, i)
                     inject = f"    const/4 {reg}, 0x1  # UNGUARD: Room DAO prem=1\n"
@@ -1037,6 +2114,32 @@ class PatchEngine:
                     _REPORT.add("storageIO", rel, j, "room_dao_one")
                     n_tot += 1; i = j + 2; continue
 
+            # MMKV.decodeBool near premium key → force true
+            if ("MMKV;->decodeBool(" in s and "invoke-" in s):
+                if self._near_prem_key(lines, i, lookback=4):
+                    reg = _next_move_result(lines, i)
+                    if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
+                        j = _next_move_result_idx(lines, i)
+                        end = _method_end(lines, i)
+                        inject = f"    const/4 {reg}, 0x1  # UNGUARD: MMKV.decodeBool=true\n"
+                        lines.insert(j + 1, inject)
+                        if end: _propagate_register_alias(lines, j+1, reg, "0x1", end+1)
+                        _REPORT.add("storageIO", rel, j, "mmkv_bool_true")
+                        n_tot += 1; i = j + 2; continue
+
+            # MMKV.decodeInt near premium key → force 1
+            if ("MMKV;->decodeInt(" in s and "invoke-" in s):
+                if self._near_prem_key(lines, i, lookback=4):
+                    reg = _next_move_result(lines, i)
+                    if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
+                        j = _next_move_result_idx(lines, i)
+                        end = _method_end(lines, i)
+                        inject = f"    const/4 {reg}, 0x1  # UNGUARD: MMKV.decodeInt=1\n"
+                        lines.insert(j + 1, inject)
+                        if end: _propagate_register_alias(lines, j+1, reg, "0x1", end+1)
+                        _REPORT.add("storageIO", rel, j, "mmkv_int_one")
+                        n_tot += 1; i = j + 2; continue
+
             i += 1
 
         if n_tot:
@@ -1044,6 +2147,104 @@ class PatchEngine:
             log("patch", f"Storage  {rel}  ({n_tot}x)", indent=1)
             _verify_patch(path, expected_min=n_tot)
         return n_tot
+
+    def _write_fake_iap_smali(self) -> None:
+        """Write FakeIAP.smali into the decompiled smali tree.
+
+        Only injected when files calling IInAppBillingService.Stub.asInterface()
+        are found (old AIDL-based billing, pre-v4). Modern apps using gRPC
+        billing (v4+) don't use asInterface() so this is skipped.
+
+        When product IDs can be extracted from the smali, they are embedded in
+        the fake purchase JSON returned by getBuyIntent (transaction code 3).
+        This means the app's own product IDs appear in the fake purchase receipt,
+        making the PoC realistic: the app's purchase callback receives a purchase
+        object whose getProducts() list matches what the developer registered.
+        """
+        # Check if any IAP file contains AIDL asInterface() call
+        has_aidl = False
+        for rel in self._iap:
+            path = os.path.join(self.base, rel)
+            try:
+                content = open(path, encoding="utf-8", errors="ignore").read()
+                if "IInAppBillingService" in content and "asInterface" in content:
+                    has_aidl = True
+                    break
+            except Exception:
+                pass
+        if not has_aidl:
+            return
+
+        # Extract product IDs from the app's own smali
+        product_ids = self.extract_product_ids()
+        # Use first found ID, or generic fallback
+        product_id = sorted(product_ids)[0] if product_ids else "bypass"
+        if product_ids:
+            log("ok",
+                f"FakeIAP: using app product IDs: {sorted(product_ids)[:5]}",
+                indent=1)
+
+        # Build purchase JSON with real product ID - escape " as \" for smali
+        raw_json = (
+            f'{{"orderId":"UG.{product_id}","packageName":"com.ug",'
+            f'"productIds":["{product_id}"],"purchaseState":0,'
+            f'"purchaseToken":"ug_token_{product_id}","acknowledged":true}}'
+        )
+        smali_json = raw_json.replace('"'  , '\\"'  )
+
+        # Stamp product ID into FakeIAP smali template
+        smali_content = _SMALI_FAKE_IAP.replace(
+            '__UG_PRODUCT_ID__', product_id).replace(
+            '__UG_PURCHASE_JSON__', smali_json)
+
+        pkg_dir = Path(self.base) / "smali" / "com" / "ug" / "iap"
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        dest = pkg_dir / "FakeIAP.smali"
+        if not dest.is_file():
+            dest.write_text(smali_content, encoding="utf-8")
+            log("ok",
+                f"FakeIAP.smali injected (product_id={product_id!r})",
+                indent=1)
+
+    # ── IAP product ID extractor ─────────────────────────────────────────────
+    _IAP_CALL_RE = re.compile(
+        r"getBuyIntent|querySkuDetails|queryPurchasesAsync|"
+        r"queryProductDetailsAsync|addProductId|setSkusList|setProductId",
+        re.IGNORECASE)
+    _SKU_STR_RE  = re.compile(r'const-string\s+\w+,\s+"([a-z][a-z0-9._]{2,99})"')
+    _SKU_NOISE_RE = re.compile(
+        r"^(?:android|google|firebase|unity|applovin|facebook|"
+        r"ironSource|chartboost|vungle|token|session|provider|package|"
+        r"protocol|process|profile|signal|mediation|waterfall|bundle_|"
+        r"native_|start_|end_|load_|show_|init_)", re.IGNORECASE)
+
+    def extract_product_ids(self) -> set[str]:
+        """
+        Scan IAP-tagged smali files for hardcoded product ID strings.
+        Product IDs appear as const-strings near querySkuDetails /
+        getBuyIntent / queryProductDetailsAsync calls.
+        Returns a set of candidate product ID strings.
+        """
+        found: set[str] = set()
+        for rel in self._iap:
+            path = os.path.join(self.base, rel)
+            try:
+                text = open(path, encoding="utf-8", errors="ignore").read()
+            except Exception:
+                continue
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                window = "\n".join(lines[max(0, i-5):min(len(lines), i+12)])
+                if not self._IAP_CALL_RE.search(window):
+                    continue
+                for m in self._SKU_STR_RE.finditer(window):
+                    val = m.group(1)
+                    if self._SKU_NOISE_RE.search(val):
+                        continue
+                    # Must look like a product ID: has _ or . and no spaces
+                    if ("_" in val or "." in val) and len(val) >= 4:
+                        found.add(val)
+        return found
 
     def _near_prem_key(self, lines, idx, lookback=6) -> bool:
         start = max(0, idx - lookback)
@@ -1087,7 +2288,7 @@ class PatchEngine:
             if ("JSONObject;->getInt(" in s or "JSONObject;->optInt(" in s):
                 if self._near_status_key(lines, i, lookback=5):
                     reg = _next_move_result(lines, i)
-                    if reg:
+                    if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                         j = _next_move_result_idx(lines, i)
                         end = _method_end(lines, i)
                         lines.insert(j + 1,
@@ -1096,11 +2297,32 @@ class PatchEngine:
                         _REPORT.add("serverIO", rel, j, "json_int_one")
                         n_tot += 1; i = j + 2; continue
 
+            # JSONObject.getLong/optLong near status key → force 1L
+            # getLong() returns J (long, 64-bit) → move-result-wide → const-wide
+            if ("JSONObject;->getLong(" in s or "JSONObject;->optLong(" in s):
+                if self._near_status_key(lines, i, lookback=5):
+                    # move-result-wide uses two consecutive registers
+                    j = _next_move_result_idx(lines, i)
+                    if j is not None:
+                        mw = re.match(r"[ \t]*move-result-wide\s+([vp]\d+)", lines[j])
+                        if mw:
+                            reg = mw.group(1)
+                            try:
+                                rn = int(reg[1:])
+                                if rn <= 14:  # need reg and reg+1 both ≤ 15
+                                    lines.insert(j + 1,
+                                        f"    const-wide/16 {reg}, 0x1"
+                                        f"  # UNGUARD: JSON long=1\n")
+                                    _REPORT.add("serverIO", rel, j, "json_long_one")
+                                    n_tot += 1; i = j + 2; continue
+                            except (ValueError, IndexError):
+                                pass
+
             # JSONObject.getBoolean/optBoolean near status/success key → force true
             if ("JSONObject;->getBoolean(" in s or "JSONObject;->optBoolean(" in s):
                 if self._near_status_key(lines, i, lookback=5):
                     reg = _next_move_result(lines, i)
-                    if reg:
+                    if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                         j = _next_move_result_idx(lines, i)
                         end = _method_end(lines, i)
                         lines.insert(j + 1,
@@ -1113,7 +2335,7 @@ class PatchEngine:
             if (("retrofit2/Response;->code()" in s or
                  "okhttp3/Response;->code()" in s) and "invoke-virtual" in s):
                 reg = _next_move_result(lines, i)
-                if reg:
+                if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                     j = _next_move_result_idx(lines, i)
                     lines.insert(j + 1,
                         f"    const/16 {reg}, 0xc8  # UNGUARD: HTTP=200\n")
@@ -1124,7 +2346,7 @@ class PatchEngine:
             if (("retrofit2/Response;->isSuccessful()" in s or
                  "okhttp3/Response;->isSuccessful()" in s) and "invoke-virtual" in s):
                 reg = _next_move_result(lines, i)
-                if reg:
+                if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                     j = _next_move_result_idx(lines, i)
                     end = _method_end(lines, i)
                     lines.insert(j + 1,
@@ -1136,7 +2358,7 @@ class PatchEngine:
             # HttpURLConnection.getResponseCode() → 200
             if ("HttpURLConnection;->getResponseCode()" in s and "invoke-virtual" in s):
                 reg = _next_move_result(lines, i)
-                if reg:
+                if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                     j = _next_move_result_idx(lines, i)
                     lines.insert(j + 1,
                         f"    const/16 {reg}, 0xc8  # UNGUARD: HTTP=200\n")
@@ -1147,7 +2369,7 @@ class PatchEngine:
             if ("JSONArray;->length()" in s and "invoke-virtual" in s):
                 if self._near_status_key(lines, i, lookback=8):
                     reg = _next_move_result(lines, i)
-                    if reg:
+                    if reg and not (reg.startswith("v") and int(reg[1:]) > 15):
                         j = _next_move_result_idx(lines, i)
                         lines.insert(j + 1,
                             f"    const/4 {reg}, 0x1  # UNGUARD: JSONArray.length=1\n")
@@ -1200,7 +2422,7 @@ class PatchEngine:
                 _REPORT.add("ads", rel, i, "load_nop")
                 patched += 1
                 log("patch", f"Ads load nop  {rel}  L{i}", indent=1)
-                i += 1 + 1 + len(nb); continue
+                i += 1 + 1 + 1 + len(nb); continue
 
             # ── show* method: suppress ad display ─────────────────────────────
             if self._ADS_SHOW_RE.search(stripped):
@@ -1213,7 +2435,7 @@ class PatchEngine:
                 _REPORT.add("ads", rel, i, "show_nop")
                 patched += 1
                 log("patch", f"Ads show nop  {rel}  L{i}", indent=1)
-                i += 1 + 1 + len(nb); continue
+                i += 1 + 1 + 1 + len(nb); continue
 
             # ── isLoaded / isReady: return false so app won't crash ───────────
             if self._ADS_READY_RE.search(stripped):
@@ -1226,7 +2448,7 @@ class PatchEngine:
                 _REPORT.add("ads", rel, i, "ready_false")
                 patched += 1
                 log("patch", f"Ads isReady→false  {rel}  L{i}", indent=1)
-                i += 1 + 1 + len(nb); continue
+                i += 1 + 1 + 1 + len(nb); continue
 
             # ── Inline nop: direct SDK load/show invoke calls ─────────────────
             s = stripped
@@ -1354,6 +2576,19 @@ class CustomObfuscationEngine:
                     for k in found:
                         self.report[k].append(rel)
             return hits
+
+        # Quick pre-filter: if none of our heavyweight patterns are present
+        # anywhere in the cache, skip the full per-file scan entirely.
+        _PREFILTER = re.compile(
+            r"xor-int|AES|DES|javax/crypto|ClassLoader|dalvik/system|"
+            r"goto/|:goto_|StringBuilder|Method\.invoke", re.IGNORECASE)
+        corpus_sample = "".join(
+            text[:2000] for _, text in list(self.cache.items())[:200])
+        if not _PREFILTER.search(corpus_sample):
+            log("info",
+                "Custom obf pre-filter: no obfuscation signals in sample – "
+                "skipping full custom scan.", indent=1)
+            return {}
 
         total  = len(items)
         pb     = Progress("Obfuscation scan", total) if total > 50 else None
@@ -1582,10 +2817,10 @@ class FrameworkDetector:
         ("assets/main.jsbundle",              "react_native"),
         ("assets/android.pck",                "godot"),
         ("assets/UE4Game",                    "unreal"),
-        ("assets/UnrealGame",                 "unreal"),
-        ("assets/Paks",                       "unreal"),
-        ("assemblies/Xamarin",                "xamarin"),
-        ("assemblies/mscorlib.dll",           "xamarin"),
+        ("assets/UnrealGame",                  "unreal"),
+        ("assets/Paks",                        "unreal"),
+        ("assemblies/Xamarin",                 "xamarin"),
+        ("assemblies/mscorlib.dll",            "xamarin"),
     ]
 
     SMALI_SIGS = [
@@ -1835,6 +3070,9 @@ class CommercialObfuscationDetector:
         "jiagu360":   [r"com/qihoo/jiagu",r"com/360safe"],
         "liapp":      [r"com/infraware/liapp"],
         "tencent":    [r"com/tencent/bugly",r"legu"],
+        "pairip":     [r"com/pairip/licensecheck",r"LicenseClient",
+                       r"initializeLicenseCheck"],
+        "kiwi":       [r"com/kiwi/security"],
     }
     # Fixed: replaced (?:\S+\s+)* with enumerated optional modifiers.
     # The old pattern caused catastrophic backtracking on large IL2CPP smali files
@@ -1851,6 +3089,7 @@ class CommercialObfuscationDetector:
         "dexguard":35,"dexguard_stubs":25,"arxan":40,"dasho":30,
         "appsealing":30,"bangcle":30,"ijiami":30,"jiagu360":30,
         "liapp":25,"tencent":10,"proguard_rename":15,"packer_native":20,
+        "pairip":35,"kiwi":20,
     }
 
     def __init__(self, cache: SmaliCache, target_apk: str, workers: int = MAX_WORKERS):
@@ -1862,7 +3101,23 @@ class CommercialObfuscationDetector:
 
     def detect(self) -> dict:
         log("head", "Commercial Obfuscation Detection")
+        # Phase 1: instant ZIP scan (checks lib names, folder names)
         self._check_zip()
+        # If ZIP scan already found strong commercial obfuscator signals,
+        # skip the expensive per-file smali scan entirely.
+        zip_score = sum(self.SCORE_MAP.get(k, 10) for k in self.found)
+        if zip_score >= 35:
+            log("info",
+                f"ZIP scan score={zip_score} – skipping full smali scan "
+                f"(obfuscator already confirmed).", indent=1)
+            for k in self.found: self.score += self.SCORE_MAP.get(k, 10)
+            self.score = min(self.score, 100)
+            if self.found:
+                for tool, ev in self.found.items():
+                    log("detect", f"{C.BD}{tool.upper()}{C.RS}  ({len(ev)} hit(s))", indent=1)
+                log("warn", f"Commercial obfuscation score: {C.BD}{self.score}/100{C.RS}")
+            return dict(self.found)
+        # Phase 2: full smali scan (only if ZIP gave no strong signal)
         items = list(self.cache.items())
         lock  = threading.Lock()
 
@@ -1941,10 +3196,23 @@ class CommercialObfuscationDetector:
         try:
             with zipfile.ZipFile(self.target, "r") as z:
                 for name in z.namelist():
-                    if re.search(r"libdexguard", name, re.I):
+                    nl = name.lower()
+                    if re.search(r"libdexguard", nl):
                         self.found["dexguard"].append(name)
-                    if re.search(r"libprotect|libjiagu|libshell|libsecexe", name, re.I):
+                    if re.search(r"libprotect|libjiagu|libshell|libsecexe", nl):
                         self.found["packer_native"].append(name)
+                    if re.search(r"com/pairip|pairip", nl):
+                        self.found["pairip"].append(name)
+                    if re.search(r"com/guardsquare|com/saikoa", nl):
+                        self.found["dexguard"].append(name)
+                    if re.search(r"com/arxan|com/irdeto|com/verimatrix", nl):
+                        self.found["arxan"].append(name)
+                    if re.search(r"com/inka/android/appsealing", nl):
+                        self.found["appsealing"].append(name)
+                    if re.search(r"com/qihoo/jiagu|com/360safe", nl):
+                        self.found["jiagu360"].append(name)
+                    if re.search(r"com/secshell|com/bangcle", nl):
+                        self.found["bangcle"].append(name)
         except Exception:
             pass
 
@@ -1999,6 +3267,8 @@ class AndroidPatcher:
         self.runtime_cfg = runtime_cfg or RuntimeConfig()
         self.decompiled  : str | None = None
         self.package     = "unknown"
+        # Split APKs extracted alongside the base (re-signed after build)
+        self.split_apks  : list[str] = []
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.work_dir,   exist_ok=True)
 
@@ -2025,6 +3295,47 @@ class AndroidPatcher:
         log("head", "Framework Detection Result")
         FrameworkDetector.print_report(self._framework_info)
 
+    def _merge_splits_into_base(self, base_apk: str, split_apks: list) -> str | None:
+        """Merge split APKs (arm64, density, language) into the base APK.
+        Copies lib/ and assets/ entries from each split into the base ZIP.
+        Returns path to merged signed APK, or None on failure.
+        """
+        import zipfile as _zf, shutil as _sh
+        if not base_apk or not os.path.isfile(base_apk):
+            return None
+        try:
+            out = base_apk.replace(".apk", "_merged.apk")
+            _sh.copy2(base_apk, out)
+            merged_entries = 0
+            with _zf.ZipFile(out, "a", compression=_zf.ZIP_DEFLATED) as zout:
+                existing = set(zout.namelist())
+                for split in split_apks:
+                    if not os.path.isfile(split): continue
+                    with _zf.ZipFile(split, "r") as zsplit:
+                        for entry in zsplit.infolist():
+                            name = entry.filename
+                            if (name.startswith("lib/") or name.startswith("assets/")):
+                                if name not in existing:
+                                    zout.writestr(entry, zsplit.read(name))
+                                    existing.add(name)
+                                    merged_entries += 1
+            if merged_entries == 0:
+                try: os.unlink(out)
+                except: pass
+                log("info", "Splits had no lib/assets to merge.", indent=1)
+                return None
+            log("ok", f"Merged {merged_entries} entries from {len(split_apks)} split(s).", indent=1)
+            # Re-sign the merged APK
+            signed_out = self.sign(out, "merged")
+            if signed_out and os.path.isfile(signed_out):
+                try: os.unlink(out)
+                except: pass
+                return signed_out
+            return out
+        except Exception as e:
+            log("warn", f"Merge splits failed: {e}")
+            return None
+
     def handle_split_apk(self):
         ext = os.path.splitext(self.target)[1].lower()
         if ext == ".apk":
@@ -2040,30 +3351,48 @@ class AndroidPatcher:
             self._handle_generic_zip()
 
     def _handle_aab(self):
+        """
+        Convert .aab → patchable base.apk using bundletool.
+
+        Strategy (in order):
+          1. bundletool --mode=universal → universal.apk (recommended, patches all arches)
+          2. bundletool --mode=default  → per-device splits (extracts base + arch splits)
+          3. Fallback: pass .aab directly to apktool (often fails for complex bundles)
+        """
         apks_out = os.path.join(self.work_dir, "from_aab.apks")
-        if os.path.isfile(BUNDLETOOL):
-            log("info", "  bundletool build-apks --mode=universal…")
-            cmd = [
-                "java", "-jar", BUNDLETOOL, "build-apks",
-                f"--bundle={self.target}",
-                f"--output={apks_out}",
-                "--mode=universal", "--overwrite",
-            ]
+        if not os.path.isfile(BUNDLETOOL):
+            log("warn", f"  bundletool.jar not found at '{BUNDLETOOL}'. "
+                "Download from https://github.com/google/bundletool/releases "
+                "and set BUNDLETOOL env var or --bundletool flag.")
+            log("warn", "  Attempting apktool directly on AAB (may fail).")
+            return
+
+        java_opts = os.environ.get("JAVA_OPTS", "").split()
+
+        # Try universal mode first (single APK, easiest to patch)
+        for mode in ("universal", "default"):
             try:
+                log("info", f"  bundletool --mode={mode}…")
+                cmd = (["java"] + java_opts + ["-jar", BUNDLETOOL, "build-apks",
+                       f"--bundle={self.target}",
+                       f"--output={apks_out}",
+                       f"--mode={mode}", "--overwrite"])
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 if r.returncode == 0 and os.path.isfile(apks_out):
-                    log("ok", "  bundletool OK")
+                    log("ok", f"  bundletool ({mode}) OK")
                     base = self._extract_from_apks_zip(apks_out)
                     if base:
                         self.target = base
-                        log("ok", f"  Base APK: {base}"); return
+                        log("ok", f"  Base APK: {base}")
+                        return
                 else:
-                    log("warn", f"  bundletool: {r.stderr.strip()[:200]}")
+                    log("warn", f"  bundletool ({mode}): {r.stderr.strip()[:300]}")
+            except subprocess.TimeoutExpired:
+                log("warn", f"  bundletool ({mode}) timed out (300s)")
             except Exception as e:
-                log("warn", f"  bundletool error: {e}")
-        else:
-            log("warn", f"  bundletool.jar not found at '{BUNDLETOOL}'")
-        log("warn", "  Trying apktool directly on AAB (may fail for complex bundles).")
+                log("warn", f"  bundletool ({mode}) error: {e}")
+
+        log("warn", "  All bundletool modes failed – trying apktool directly on AAB.")
 
     def _handle_apks_zip(self, zip_path: str):
         base = self._extract_from_apks_zip(zip_path)
@@ -2074,6 +3403,11 @@ class AndroidPatcher:
             log("warn", "  Could not locate base APK inside archive.")
 
     def _extract_from_apks_zip(self, zip_path: str):
+        """
+        Extract the base APK from an .apks / bundletool ZIP.
+        Also extract all split APKs into self.split_apks so they can be
+        re-signed later and passed to `adb install-multiple`.
+        """
         out_dir = os.path.join(self.work_dir, "apks_ex")
         os.makedirs(out_dir, exist_ok=True)
         try:
@@ -2093,6 +3427,19 @@ class AndroidPatcher:
                 dest = os.path.join(out_dir, os.path.basename(chosen))
                 with z.open(chosen) as sf, open(dest, "wb") as df:
                     shutil.copyfileobj(sf, df)
+
+                # Extract all split APKs (config.arm64_v8a, config.en, etc.)
+                splits = [n for n in nl if n.endswith(".apk") and n != chosen]
+                self.split_apks = []
+                for sp in splits:
+                    sp_dest = os.path.join(out_dir, os.path.basename(sp))
+                    with z.open(sp) as sf2, open(sp_dest, "wb") as df2:
+                        shutil.copyfileobj(sf2, df2)
+                    self.split_apks.append(sp_dest)
+                if self.split_apks:
+                    log("info",
+                        f"  Extracted {len(self.split_apks)} split APK(s) "
+                        f"(will be re-signed after build)", indent=1)
                 return dest
         except Exception as e:
             log("warn", f"  ZIP extraction error: {e}")
@@ -2115,6 +3462,19 @@ class AndroidPatcher:
                     shutil.copyfileobj(sf, df)
                 self.target = dest
                 log("ok", f"  XAPK base APK: {dest}")
+                # Extract remaining APKs as splits
+                self.split_apks = []
+                for sp in apks:
+                    if sp == best:
+                        continue
+                    sp_dest = os.path.join(out_dir, os.path.basename(sp))
+                    with z.open(sp) as sf2, open(sp_dest, "wb") as df2:
+                        shutil.copyfileobj(sf2, df2)
+                    self.split_apks.append(sp_dest)
+                if self.split_apks:
+                    log("info",
+                        f"  {len(self.split_apks)} companion split APK(s) found",
+                        indent=1)
         except Exception as e:
             log("warn", f"  XAPK extraction failed: {e}")
 
@@ -2169,8 +3529,11 @@ class AndroidPatcher:
                 time.sleep(0.15); i += 1
         for extra in [["--no-res"], []]:
             t = threading.Thread(target=_spin, daemon=True); t.start()
-            cmd = ["java", "-jar", APKTOOL_JAR, "d", self.target,
-                   "-o", self.decompiled, "-f"] + extra
+            # Pass JAVA_OPTS if set (allows: JAVA_OPTS="-Xmx2g" for large APKs)
+            java_opts = os.environ.get("JAVA_OPTS", "").split()
+            cmd = (["java"] + java_opts +
+                   ["-jar", APKTOOL_JAR, "d", self.target,
+                    "-o", self.decompiled, "-f"] + extra)
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             except subprocess.TimeoutExpired:
@@ -2205,7 +3568,8 @@ class AndroidPatcher:
                     sys.stdout.flush()
                 time.sleep(0.15); i += 1
         t = threading.Thread(target=_spin, daemon=True); t.start()
-        cmd = ["java", "-jar", APKTOOL_JAR, "b", vdir, "-o", out]
+        java_opts = os.environ.get("JAVA_OPTS", "").split()
+        cmd = ["java"] + java_opts + ["-jar", APKTOOL_JAR, "b", vdir, "-o", out]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         except subprocess.TimeoutExpired:
@@ -2217,12 +3581,31 @@ class AndroidPatcher:
             with _PLOCK: sys.stdout.write("\r"+" "*82+"\r"); sys.stdout.flush()
         if r.returncode == 0:
             kb = os.path.getsize(out) // 1024 if os.path.exists(out) else 0
-            log("ok", f"Unsigned [{label}]: {out} ({kb} KB)"); return out
-        err_lines = [l for l in r.stderr.splitlines()
-                     if "error" in l.lower() or "smali" in l.lower()][:4]
+            log("ok", f"Unsigned [{label}]: {out} ({kb} KB)")
+            # Post-build DEX sanity check: confirm at least one UNGUARD string
+            # made it into the compiled DEX. If not, the patched smali was not
+            # compiled (e.g. apktool used a cached version or wrong directory).
+            if not _verify_dex_contains_patches(out):
+                log("warn",
+                    f"DEX verification: UNGUARD markers not found in rebuilt APK. "
+                    f"Patches may not be active. Check --keep-work output.",
+                    indent=1)
+            return out
+        # Expanded error capture: show ALL lines mentioning error/locals/smali/verify
+        all_err = r.stderr.splitlines() + r.stdout.splitlines()
+        err_lines = [l for l in all_err
+                     if any(k in l.lower() for k in
+                            ("error","smali","locals","verify","invalid","illegal",
+                             "method","register","expected","found at"))
+                     ][:10]
         log("err", f"Rebuild [{label}] failed:")
         for l in err_lines:
             log("err", l.strip(), indent=1)
+        if not err_lines:
+            # Show last 6 lines of stderr as fallback
+            for l in r.stderr.splitlines()[-6:]:
+                if l.strip():
+                    log("err", l.strip(), indent=1)
         return None
 
     # ── Sign ──────────────────────────────────────────────────────────────────
@@ -2260,6 +3643,25 @@ class AndroidPatcher:
         else:
             log("warn", "apksigner not found – falling back to jarsigner.")
 
+        # jarsigner ONLY applies v1 (JAR) signatures.
+        # Android 11+ (API 30+) requires v2 or higher; v1-only APKs will refuse to install.
+        # Warn the user strongly if we have to fall back here.
+        if not has_apksigner and has_jarsigner:
+            # Try to detect minSdk from decompiled manifest
+            try:
+                mf_path = os.path.join(self.decompiled or "", "apktool.yml")
+                if os.path.isfile(mf_path):
+                    import re as _re
+                    yml = open(mf_path).read()
+                    m = _re.search(r"minSdkVersion:\s*'?(\d+)'?", yml)
+                    if m and int(m.group(1)) >= 30:
+                        log("warn",
+                            f"SIGNING WARNING: jarsigner produces v1 (JAR) signatures only. "
+                            f"minSdk={m.group(1)} ≥ 30 – this APK WILL NOT INSTALL on "
+                            f"Android 11+. Install apksigner (Android SDK build-tools) "
+                            f"and ensure it is on PATH.", indent=1)
+            except Exception:
+                pass
         # FIX: jarsigner fallback now uses SHA256withRSA (not deprecated SHA1)
         if has_jarsigner:
             aligned = os.path.join(self.work_dir, f"aligned_{label}.apk")
@@ -2357,27 +3759,70 @@ class AndroidPatcher:
         return patches, vdir
 
     def _rebuild_and_sign(self, patches: frozenset, vdir: str) -> str | None:
-        slug     = patches_to_slug(patches)
-        unsigned = self.rebuild(vdir, slug)
+        slug      = patches_to_slug(patches)
+        unsigned  = self.rebuild(vdir, slug)
         if not unsigned:
             return None
-        src  = self.sign(unsigned, slug)
-        base = os.path.splitext(os.path.basename(self.target))[0]
-        final = os.path.join(self.output_dir, f"{base}_{slug}.apk")
-        # FIX: atomic copy to output directory
-        tmp_final = final + ".ug_tmp"
-        shutil.copy(src, tmp_final)
-        os.replace(tmp_final, final)
-        log("ok", f"{C.BD}{C.G}Output: {final}{C.RS}")
+        signed_base = self.sign(unsigned, slug)
+        base_name   = os.path.splitext(os.path.basename(self.target))[0]
+
+        # ── Re-sign all companion split APKs ─────────────────────────────────
+        signed_splits: list[str] = []
+        for split_path in self.split_apks:
+            sp_name   = os.path.splitext(os.path.basename(split_path))[0]
+            sp_signed = self.sign(split_path, sp_name)
+            if sp_signed and os.path.isfile(sp_signed):
+                signed_splits.append(sp_signed)
+
+        final = os.path.join(self.output_dir, f"{base_name}_{slug}.apk")
+
+        if signed_splits:
+            # ── Merge base + splits → single installable APK ─────────────────
+            # User gave a split archive as input; they expect ONE file back.
+            log("info", f"Merging {len(signed_splits)} split(s) into base APK…")
+            merged = self._merge_splits_into_base(signed_base, signed_splits)
+            if merged and os.path.isfile(merged):
+                try:
+                    shutil.copy(merged, final)
+                    if merged != final:
+                        try: os.unlink(merged)
+                        except: pass
+                except shutil.SameFileError:
+                    final = merged
+                log("ok", f"Output (single APK): {C.G}{final}{C.RS}")
+                return final
+            # Merge failed – fall back to separate files + adb install-multiple
+            log("warn", "Merge failed – falling back to separate files.")
+            shutil.copy(signed_base, final)
+            log("ok", f"Output (base): {C.G}{final}{C.RS}")
+            split_outs: list[str] = []
+            for sp in signed_splits:
+                sp_out = os.path.join(
+                    self.output_dir,
+                    os.path.splitext(os.path.basename(sp))[0] + "_resigned.apk")
+                shutil.copy(sp, sp_out)
+                split_outs.append(sp_out)
+                log("ok", f"  Split: {sp_out}", indent=1)
+            adb_cmd = ("adb install-multiple " +
+                       " ".join(f'"{p}"' for p in [final] + split_outs))
+            log("ok", f"Install command:")
+            log("info", f"  {adb_cmd}", indent=1)
+            return final
+
+        # ── No splits: single base APK ────────────────────────────────────────
+        shutil.copy(signed_base, final)
+        log("ok", f"Output: {C.G}{final}{C.RS}")
         return final
 
     # ── Main run ──────────────────────────────────────────────────────────────
     def run(self, patches: frozenset | None = None,
             detect_only: bool = False,
-            report_path: str | None = None) -> dict:
+            report_path: str | None = None,
+            merge_splits: bool = False) -> dict:
         banner()
         t0  = time.time()
         cfg = self.runtime_cfg
+        self.merge_splits = merge_splits
 
         self.handle_split_apk()
         self.detect_engine()
@@ -2390,28 +3835,37 @@ class AndroidPatcher:
         cache = SmaliCache(self.decompiled)
         cache.load()
 
-        log("head", "Obfuscation Analysis")
-        _t1  = time.time()
-        comm = CommercialObfuscationDetector(cache, self.target, self.workers)
-        cust = CustomObfuscationEngine(cache, self.workers)
-        comm.detect()
-        cust.detect()
-        obf_score = comm.score + cust.score
-        log("ok", f"Obfuscation analysis: {time.time()-_t1:.1f}s  score={obf_score}/200")
-
-        if not self.skip_deob and obf_score > 10:
-            _t2 = time.time()
-            log("info", f"Score {obf_score} > 10 – running deobfuscation…")
-            cust.deobfuscate()
-            cache.invalidate()
-            cache.load(show_progress=False)
-            log("ok", f"Deobfuscation pass: {time.time()-_t2:.1f}s")
+        # ── Obfuscation analysis (skipped entirely when --no-deob) ─────────────
+        # With --no-deob this block is completely bypassed – no smali scan,
+        # no progress bar, straight to API detection.
+        obf_score = 0
+        cust      = None
+        if self.skip_deob:
+            log("info", "Obfuscation analysis skipped (--no-deob).")
         else:
-            log("info", "Obfuscation score low or --no-deob – skipping.")
+            log("head", "Obfuscation Analysis")
+            _t1  = time.time()
+            comm = CommercialObfuscationDetector(cache, self.target, self.workers)
+            cust = CustomObfuscationEngine(cache, self.workers)
+            comm.detect()
+            cust.detect()
+            obf_score = comm.score + cust.score
+            log("ok", f"Obfuscation analysis: {time.time()-_t1:.1f}s  score={obf_score}/200")
 
-        log("head", "API Detection")
+            if obf_score > 10:
+                _t2 = time.time()
+                log("info", f"Score {obf_score} > 10 – running deobfuscation…")
+                cust.deobfuscate()
+                cache.invalidate()
+                cache.load(show_progress=False)
+                log("ok", f"Deobfuscation pass: {time.time()-_t2:.1f}s")
+            else:
+                log("info", "Obfuscation score ≤ 10 – deobfuscation not needed.")
+
         master = PatchEngine(self.decompiled, cache, self.workers)
-        master.find_all()
+        # Pass the requested patch categories so only relevant patterns are scanned.
+        # detect_only=True → scan all (user wants the full picture)
+        master.find_all(needed=None if detect_only else patches)
 
         if detect_only or patches is None:
             log("ok", f"Detect-only complete ({time.time()-t0:.1f}s)")
@@ -2439,7 +3893,8 @@ class AndroidPatcher:
             learner = LearningEngine(db) if cfg.learn else None
             exc_ana = ExceptionAnalyzer()
             console = LiveConsole(learn_engine=learner, exc_analyzer=exc_ana)
-            server  = BridgeServer(cfg.bridge_port, on_event=console.on_event)
+            server  = BridgeServer(cfg.bridge_port, on_event=console.on_event,
+                                     bind_host=cfg.bridge_bind)
             try:
                 server.start()
                 log("info", "Waiting for APK connection… (Ctrl+C to stop)")
@@ -2458,6 +3913,15 @@ class AndroidPatcher:
             _print_runtime_instructions(cfg, final)
 
         elapsed = time.time() - t0
+        # -- Merge splits into single APK if requested
+        if getattr(self, 'merge_splits', False) and getattr(self, 'split_apks', []):
+            _sp = (list(self.split_apks.values())
+                   if isinstance(self.split_apks, dict) else list(self.split_apks))
+            _mg = self._merge_splits_into_base(final, _sp)
+            if _mg:
+                final = _mg
+                log('ok', f'Merged APK (single install): {C.G}{final}{C.RS}')
+
         log("head", f"Build Summary  ({elapsed:.0f}s)")
         label = patches_to_label(patches)
         if final and os.path.exists(final):
@@ -2486,8 +3950,6 @@ class AndroidPatcher:
             if self.work_dir.startswith(tempfile.gettempdir()):
                 shutil.rmtree(self.work_dir, ignore_errors=True)
                 log("info","Temp workspace removed.")
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  Smali-file patcher  (single / bulk .smali patch mode)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2548,6 +4010,11 @@ class SmaliFilePatcher:
             _p(r"\.method.+(?:checkAppIntegrity|verifySignature|checkSignature|"
                r"validateIntegrity|verifyInstall|verifyDevice)\(",
                "integrity", "INTEGRITY_METHOD",  "Custom integrity check method"),
+            _p(r"Lcom/pairip/licensecheck/",
+               "integrity", "PAIRIP",            "PairIP license system (very common in Unity games)"),
+            _p(r"initializeLicenseCheck|scheduleRepeatedLicenseCheck|"
+               r"reportSuccessfulLicenseCheck",
+               "integrity", "PAIRIP_METHODS",    "PairIP license lifecycle methods"),
 
             # ── Ads ────────────────────────────────────────────────────────────
             _p(r"Lcom/google/android/gms/ads/",
@@ -2774,13 +4241,10 @@ class SmaliFilePatcher:
         print()
         log("ok", f"{ok_count}/{len(results)} files processed successfully.")
 
-
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  UnGuard v3.0.0  ─  RUNTIME ANALYSIS LAYER
+#  UnGuard v3.3.1  ─  RUNTIME ANALYSIS LAYER
 #  All classes in this section are optional modules activated by CLI flags.
-#  The base static-patch pipeline (v2.0.0) is completely unaffected when
+#  The base static-patch pipeline is completely unaffected when
 #  none of the runtime flags are supplied.
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2807,25 +4271,28 @@ class RuntimeConfig:
     learn         : bool = False   # --learn           observe + record behaviour profile
     hybrid        : bool = False   # --hybrid          apply learned rules as static patches
     net_debug     : bool = False   # --net-debug       stream OkHttp / network traffic live
+    fake_google_verify : bool = False   # new: intercept Google validation and return success
     bridge_port   : int  = 17185   # TCP port for APK ↔ UnGuard event bridge
     proxy_port    : int  = 8080    # local MITM proxy port (future extension)
     profile_db    : str  = "unguard_profile.db"
     rules_file    : str  = "unguard_rules.json"
+    bridge_bind   : str  = "127.0.0.1"  # --bridge-bind (0.0.0.0 for Termux LAN)
 
     @property
     def any_runtime(self) -> bool:
         """True if any runtime feature is enabled (bridge must be started)."""
         return (self.trace_runtime or self.tls_intercept or self.learn
-                or self.hybrid or self.net_debug)
+                or self.hybrid or self.net_debug or self.fake_google_verify)
 
     @property
     def needs_bridge(self) -> bool:
         """True when we must inject UGBridge and start the server."""
-        return self.trace_runtime or self.learn or self.net_debug
+        return self.trace_runtime or self.learn or self.net_debug or self.fake_google_verify
 
     @property
     def needs_net_interceptor(self) -> bool:
-        return self.net_debug or self.learn
+        """True when we must inject the OkHttp interceptor (logging + fake responses)."""
+        return self.net_debug or self.learn or self.fake_google_verify
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Smali + XML templates injected into the decompiled APK
@@ -3009,6 +4476,8 @@ _SMALI_UGBRIDGE = """\
 .end method
 """
 
+_SMALI_FAKE_IAP = '.class public final Lcom/ug/iap/FakeIAP;\n.super Landroid/os/Binder;\n\n# UnGuard FakeIAP - fake IInAppBillingService binder (AIDL billing PoC)\n# Intercepts billing AIDL at source. Returns success with real product ID.\n# Product ID embedded at build time: __UG_PRODUCT_ID__\n\n.field private static sInstance:Lcom/ug/iap/FakeIAP;\n\n.method public constructor <init>()V\n    .locals 0\n    invoke-direct {p0}, Landroid/os/Binder;-><init>()V\n    return-void\n.end method\n\n.method public static getInstance()Lcom/ug/iap/FakeIAP;\n    .locals 1\n    sget-object v0, Lcom/ug/iap/FakeIAP;->sInstance:Lcom/ug/iap/FakeIAP;\n    if-nez v0, :ret\n    new-instance v0, Lcom/ug/iap/FakeIAP;\n    invoke-direct {v0}, Lcom/ug/iap/FakeIAP;-><init>()V\n    sput-object v0, Lcom/ug/iap/FakeIAP;->sInstance:Lcom/ug/iap/FakeIAP;\n    :ret\n    return-object v0\n.end method\n\n.method public onTransact(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z\n    .locals 4\n    const/4 v0, 0x0\n    const/4 v1, 0x1\n    if-eq p1, v1, :int_ok\n    const/4 v1, 0x5\n    if-eq p1, v1, :int_ok\n    const/4 v1, 0x7\n    if-eq p1, v1, :int_ok\n    # getBuyIntent(3) / getSkuDetails(2) / getPurchases(4) / getBuyIntentExtra(6)\n    new-instance v1, Landroid/os/Bundle;\n    invoke-direct {v1}, Landroid/os/Bundle;-><init>()V\n    const-string v2, "RESPONSE_CODE"\n    invoke-virtual {v1, v2, v0}, Landroid/os/Bundle;->putInt(Ljava/lang/String;I)V\n    const/4 v2, 0x3\n    if-ne p1, v2, :check_purchases\n    # getBuyIntent: return purchase data with real product ID\n    const-string v2, "INAPP_PURCHASE_DATA"\n    const-string v3, "__UG_PURCHASE_JSON__"\n    invoke-virtual {v1, v2, v3}, Landroid/os/Bundle;->putString(Ljava/lang/String;Ljava/lang/String;)V\n    :check_purchases\n    const/4 v2, 0x4\n    if-ne p1, v2, :write_bundle\n    # getPurchases: return empty lists (no existing purchases at startup)\n    const-string v2, "INAPP_PURCHASE_ITEM_LIST"\n    new-instance v3, Ljava/util/ArrayList;\n    invoke-direct {v3}, Ljava/util/ArrayList;-><init>()V\n    invoke-virtual {v1, v2, v3}, Landroid/os/Bundle;->putStringArrayList(Ljava/lang/String;Ljava/util/ArrayList;)V\n    const-string v2, "INAPP_PURCHASE_DATA_LIST"\n    new-instance v3, Ljava/util/ArrayList;\n    invoke-direct {v3}, Ljava/util/ArrayList;-><init>()V\n    invoke-virtual {v1, v2, v3}, Landroid/os/Bundle;->putStringArrayList(Ljava/lang/String;Ljava/util/ArrayList;)V\n    :write_bundle\n    invoke-virtual {p3}, Landroid/os/Parcel;->writeNoException()V\n    invoke-virtual {p3, v1}, Landroid/os/Parcel;->writeBundle(Landroid/os/Bundle;)V\n    const/4 v0, 0x1\n    return v0\n    :int_ok\n    invoke-virtual {p3}, Landroid/os/Parcel;->writeNoException()V\n    invoke-virtual {p3, v0}, Landroid/os/Parcel;->writeInt(I)V\n    const/4 v0, 0x1\n    return v0\n.end method'
+
 # ─── UGBridge$ConnThread.smali ───────────────────────────────────────────────
 _SMALI_UGBRIDGE_CONNTHREAD = """\
 .class Lcom/ug/rt/UGBridge$ConnThread;
@@ -3035,8 +4504,7 @@ _SMALI_UGBRIDGE_CONNTHREAD = """\
 .end method
 """
 
-# ─── UGNetInterceptor.smali ──────────────────────────────────────────────────
-# Implements okhttp3.Interceptor. Captures URL, method, status before/after TLS.
+# ─── UGNetInterceptor.smali (ENHANCED with Google validation interception) ────
 _SMALI_UGNET_INTERCEPTOR = """\
 .class public Lcom/ug/rt/UGNetInterceptor;
 .super Ljava/lang/Object;
@@ -3045,7 +4513,7 @@ _SMALI_UGNET_INTERCEPTOR = """\
 
 .method public constructor <init>()V
     .locals 0
-    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
     return-void
 .end method
 
@@ -3057,58 +4525,133 @@ _SMALI_UGNET_INTERCEPTOR = """\
         }}
     .end annotation
 
-    # v0 = request
-    invoke-interface {{p1}}, Lokhttp3/Interceptor$Chain;->request()Lokhttp3/Request;
+    # Get the request
+    invoke-interface {p1}, Lokhttp3/Interceptor$Chain;->request()Lokhttp3/Request;
     move-result-object v0
 
-    # v1 = url string
-    invoke-virtual {{v0}}, Lokhttp3/Request;->url()Lokhttp3/HttpUrl;
+    # Extract URL string
+    invoke-virtual {v0}, Lokhttp3/Request;->url()Lokhttp3/HttpUrl;
     move-result-object v1
-    invoke-virtual {{v1}}, Lokhttp3/HttpUrl;->toString()Ljava/lang/String;
+    invoke-virtual {v1}, Lokhttp3/HttpUrl;->toString()Ljava/lang/String;
     move-result-object v1
 
-    # v2 = method string
-    invoke-virtual {{v0}}, Lokhttp3/Request;->method()Ljava/lang/String;
-    move-result-object v2
+    # --- FAKE GOOGLE VERIFICATION INTERCEPTION ---
+    # Check if URL contains one of the Google validation endpoints
+    const-string v2, "play.googleapis.com"
+    invoke-virtual {v1, v2}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+    move-result v2
+    if-nez v2, :check_androidpublisher
 
-    # proceed → v3 = response
-    invoke-interface {{p1, v0}}, Lokhttp3/Interceptor$Chain;->proceed(Lokhttp3/Request;)Lokhttp3/Response;
+    const-string v2, "androidpublisher"
+    invoke-virtual {v1, v2}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+    move-result v2
+    if-nez v2, :check_licensing
+
+    const-string v2, "licensing"
+    invoke-virtual {v1, v2}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+    move-result v2
+    if-eqz v2, :build_fake_response
+
+    :check_androidpublisher
+    # Fall through – not a target URL, proceed with real network
+    goto :proceed
+
+    :build_fake_response
+    # Build a fake success response
+    # 1. Create a ResponseBody with JSON content (adjust payload as needed)
+    const-string v2, "application/json"
+    const-string v3, "UTF-8"
+    const-string v4, "{\\"isLicensed\\":true,\\"purchaseState\\":0,\\"consumptionState\\":1}"
+    invoke-static {v4, v3}, Lokhttp3/ResponseBody;->create(Ljava/lang/String;Ljava/nio/charset/Charset;)Lokhttp3/ResponseBody;
     move-result-object v3
 
-    # v4 = status code as string
-    invoke-virtual {{v3}}, Lokhttp3/Response;->code()I
-    move-result v4
-    invoke-static {{v4}}, Ljava/lang/Integer;->toString(I)Ljava/lang/String;
+    # 2. Build a Response object
+    new-instance v4, Lokhttp3/Response$Builder;
+    invoke-direct {v4}, Lokhttp3/Response$Builder;-><init>()V
+    const/16 v5, 0xc8                # HTTP 200
+    invoke-virtual {v4, v5}, Lokhttp3/Response$Builder;->code(I)Lokhttp3/Response$Builder;
+    move-result-object v4
+    const-string v5, "OK"
+    invoke-virtual {v4, v5}, Lokhttp3/Response$Builder;->message(Ljava/lang/String;)Lokhttp3/Response$Builder;
+    move-result-object v4
+    invoke-virtual {v4, v0}, Lokhttp3/Response$Builder;->request(Lokhttp3/Request;)Lokhttp3/Response$Builder;
+    move-result-object v4
+    const-string v5, "Connection"
+    const-string v6, "close"
+    invoke-virtual {v4, v5, v6}, Lokhttp3/Response$Builder;->header(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Response$Builder;
+    move-result-object v4
+    invoke-virtual {v4, v3}, Lokhttp3/Response$Builder;->body(Lokhttp3/ResponseBody;)Lokhttp3/Response$Builder;
+    move-result-object v4
+    invoke-virtual {v4}, Lokhttp3/Response$Builder;->build()Lokhttp3/Response;
+    move-result-object v2
+
+    # Log the interception (optional)
+    new-instance v3, Ljava/lang/StringBuilder;
+    invoke-direct {v3}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v4, "{{\\"url\\":\\""
+    invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v3
+    invoke-virtual {v3, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v3
+    const-string v4, "\\",\\"m\\":\\""
+    invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v3
+    invoke-virtual {v0}, Lokhttp3/Request;->method()Ljava/lang/String;
+    move-result-object v4
+    invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v3
+    const-string v4, "\\",\\"s\\":200}}"
+    invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v3
+    invoke-virtual {v3}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v3
+
+    const-string v4, "NET"
+    invoke-static {v4, v3}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
+
+    # Return the fake response
+    return-object v2
+
+    :proceed
+    # Normal flow: call the chain and get the real response
+    invoke-interface {p1, v0}, Lokhttp3/Interceptor$Chain;->proceed(Lokhttp3/Request;)Lokhttp3/Response;
+    move-result-object v2
+
+    # Log it (optional)
+    invoke-virtual {v2}, Lokhttp3/Response;->code()I
+    move-result v3
+    invoke-static {v3}, Ljava/lang/Integer;->toString(I)Ljava/lang/String;
+    move-result-object v3
+
+    new-instance v4, Ljava/lang/StringBuilder;
+    invoke-direct {v4}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v5, "{{\\"url\\":\\""
+    invoke-virtual {v4, v5}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    invoke-virtual {v4, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    const-string v5, "\\",\\"m\\":\\""
+    invoke-virtual {v4, v5}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    invoke-virtual {v0}, Lokhttp3/Request;->method()Ljava/lang/String;
+    move-result-object v5
+    invoke-virtual {v4, v5}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    const-string v5, "\\",\\"s\\":"
+    invoke-virtual {v4, v5}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    invoke-virtual {v4, v3}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    const-string v5, "}}"
+    invoke-virtual {v4, v5}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    invoke-virtual {v4}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
     move-result-object v4
 
-    # Build NET event JSON  {"url":"...","m":"...","s":NNN}
-    new-instance v5, Ljava/lang/StringBuilder;
-    invoke-direct {{v5}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v6, "{{\\\"url\\\":\\\""
-    invoke-virtual {{v5, v6}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v5
-    invoke-virtual {{v5, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v5
-    const-string v6, "\\\",\\\"m\\\":\\\""
-    invoke-virtual {{v5, v6}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v5
-    invoke-virtual {{v5, v2}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v5
-    const-string v6, "\\\",\\\"s\\\":"
-    invoke-virtual {{v5, v6}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v5
-    invoke-virtual {{v5, v4}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v5
-    const-string v6, "}}"
-    invoke-virtual {{v5, v6}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v5
-    invoke-virtual {{v5}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
-    move-result-object v5
+    const-string v5, "NET"
+    invoke-static {v5, v4}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
 
-    const-string v6, "NET"
-    invoke-static {{v6, v5}}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
-
-    return-object v3
+    return-object v2
 .end method
 """
 
@@ -3146,7 +4689,7 @@ class InstrumentationInjector:
     Operates on a decompiled APK directory.
     Injects:
       • UGBridge.smali + UGBridge$ConnThread.smali (always, when any bridge needed)
-      • UGNetInterceptor.smali + OkHttp addInterceptor() hooks (--net-debug / --learn)
+      • UGNetInterceptor.smali + OkHttp addInterceptor() hooks (--net-debug / --learn / --fake-google-verify)
       • network_security_config.xml (--tls-intercept)
       • lifecycle hooks in Activity / Fragment onCreate/onDestroy (--trace-runtime)
       • entry hooks in sensitive smali methods (--trace-runtime)
@@ -3155,6 +4698,85 @@ class InstrumentationInjector:
     BRIDGE_PKG   = "com/ug/rt"
     BRIDGE_CLS   = "Lcom/ug/rt/UGBridge;"
     NET_CLS      = "Lcom/ug/rt/UGNetInterceptor;"
+
+    # ── Register helpers (Dalvik 4-bit limit: v0-v15 only for const-string etc.) ─
+    def _get_param_slots_and_static(self, method_line: str) -> tuple[int, bool]:
+        """Extract parameter register slots and static-flag from a .method line."""
+        m = re.search(r"\.method\s+(.*?)([^(]+)(\([^)]*\).*)", method_line)
+        if not m:
+            return 0, False
+        is_static = "static" in m.group(1)
+        slots     = _count_jvm_params(m.group(3))
+        return slots, is_static
+
+    def _find_free_low_reg_pair(self, lines: list[str],
+                                method_start: int, scan_end: int,
+                                occupied: int) -> int | None:
+        """Find lowest R where vR and vR+1 are both in 0-15 and not used
+        between method_start..scan_end. Returns R or None."""
+        used: set[int] = set()
+        for k in range(method_start + 1, min(scan_end, len(lines))):
+            for hit in re.finditer(r"\bv(\d+)\b", lines[k]):
+                used.add(int(hit.group(1)))
+        for r in range(occupied, 15):   # r+1 must be <= 15
+            if r not in used and (r + 1) not in used:
+                return r
+        return None
+
+    def _bump_and_get_pair(self, lines: list[str],
+                           method_start: int, scan_end: int
+                           ) -> tuple[int | None, int]:
+        """
+        Locate .locals OR .registers, find a free (r0,r1) pair in v0-v15,
+        bump the directive, return (r0, directive_line_idx).
+        Returns (None, -1) when no suitable pair exists or cap hit.
+
+        .registers N   – N = total registers (locals + params)
+        .locals N      – N = local-only registers; params follow at vN..vN+params-1
+        We normalise .registers → effective .locals before searching.
+        """
+        param_slots, is_static = self._get_param_slots_and_static(lines[method_start])
+        implicit_this = 0 if is_static else 1
+        total_params  = param_slots + implicit_this
+
+        for j in range(method_start + 1, min(method_start + 12, len(lines))):
+            # .locals N
+            lm_l = re.match(r"([ \t]+\.locals\s+)(\d+)", lines[j])
+            # .registers N
+            lm_r = re.match(r"([ \t]+\.registers\s+)(\d+)", lines[j])
+
+            if lm_l:
+                old_locals = int(lm_l.group(2))
+                if old_locals + 2 > 250:
+                    return None, -1
+                occupied = total_params
+                r0 = self._find_free_low_reg_pair(lines, method_start, scan_end, occupied)
+                if r0 is None:
+                    return None, -1
+                new_locals = max(old_locals, r0 + 2)
+                lines[j] = f"{lm_l.group(1)}{new_locals}\n"
+                return r0, j
+
+            elif lm_r:
+                # .registers N means N total: first N-params are locals, last
+                # params are the parameter registers.
+                old_regs   = int(lm_r.group(2))
+                old_locals = max(0, old_regs - total_params)
+                if old_locals + 2 > 250:
+                    return None, -1
+                # Parameter registers live at v(old_locals)..v(old_locals+params-1)
+                # New locals start at 0; parameters shift up by 2.
+                # We pick r0 from the local range ONLY (below old_locals).
+                occupied = 0   # locals start at v0
+                r0 = self._find_free_low_reg_pair(lines, method_start, scan_end, occupied)
+                # Ensure r0, r0+1 are in the local range and ≤ 15
+                if r0 is None or r0 + 1 >= min(old_locals + 2, 16):
+                    return None, -1
+                new_regs = old_regs + 2
+                lines[j] = f"{lm_r.group(1)}{new_regs}\n"
+                return r0, j
+
+        return None, -1
 
     # Activity / Fragment parent classes that qualify for lifecycle hooks
     _LIFECYCLE_PARENTS = re.compile(
@@ -3205,7 +4827,7 @@ class InstrumentationInjector:
         self._write_bridge_smali()
         counts["bridge_classes"] = 2
 
-        # 2. Optionally write + hook OkHttp network interceptor
+        # 2. Optionally write + hook OkHttp network interceptor (logging + fake responses)
         if self.cfg.needs_net_interceptor:
             self._write_net_interceptor_smali()
             n = self._inject_okhttp_interceptor()
@@ -3236,8 +4858,7 @@ class InstrumentationInjector:
         pkg_dir = self.base / "smali" / self.BRIDGE_PKG
         pkg_dir.mkdir(parents=True, exist_ok=True)
         (pkg_dir / "UGBridge.smali").write_text(
-            _SMALI_UGBRIDGE.format(port=self.cfg.bridge_port),
-            encoding="utf-8")
+            _SMALI_UGBRIDGE, encoding="utf-8")
         (pkg_dir / "UGBridge$ConnThread.smali").write_text(
             _SMALI_UGBRIDGE_CONNTHREAD, encoding="utf-8")
 
@@ -3289,7 +4910,13 @@ class InstrumentationInjector:
                 ms = i
                 while ms > 0 and ".method" not in lines[ms]:
                     ms -= 1
-                tmp_reg = self._bump_locals_get_free_reg(lines, ms, i)
+                end_idx = next((k for k in range(ms + 1, len(lines))
+                                if lines[k].strip() == ".end method"), None)
+                scan_end = end_idx if end_idx else min(ms + 80, len(lines))
+                tmp_r0, _ = self._bump_and_get_pair(lines, ms, scan_end)
+                if tmp_r0 is None:
+                    i += 1; continue
+                tmp_reg = f"v{tmp_r0}"
                 # Inject: new interceptor, addInterceptor()
                 inject = [
                     f"    new-instance {tmp_reg}, {self.NET_CLS}\n",
@@ -3337,20 +4964,28 @@ class InstrumentationInjector:
             if METHOD_RE.search(lines[i]):
                 if any(m in lines[i] for m in (" abstract ", " native ", " bridge ")):
                     i += 1; continue
+                # Find .end method to bound the scan
+                end_idx = next((k for k in range(i + 1, len(lines))
+                                if lines[k].strip() == ".end method"), None)
+                scan_end = end_idx if end_idx else min(i + 60, len(lines))
+                r0, _ = self._bump_and_get_pair(lines, i, scan_end)
+                if r0 is None:
+                    log("warn", f"Trace: skip {method} in {sf.name} L{i}: "
+                        "no free register pair in v0-v15", indent=2)
+                    i += 1; continue
+                r1 = r0 + 1
+                # const-string is 4-bit: v0-v15 always valid (r0 ≤ 14 guaranteed)
+                hook = [
+                    f'    const-string v{r0}, "{cls_name}"\n',
+                    f'    const-string v{r1}, "{method}"\n',
+                    f'    invoke-static {{v{r0}, v{r1}}}, '
+                    f'{self.BRIDGE_CLS}->onLifecycle('
+                    f'Ljava/lang/String;Ljava/lang/String;)V\n',
+                ]
+                # Insert after .locals line (j is returned from _bump_and_get_pair
+                # but we need it; redo scan to find .locals line index)
                 for j in range(i + 1, min(i + 12, len(lines))):
-                    lm = re.match(r"([ \t]+\.locals\s+)(\d+)", lines[j])
-                    if lm:
-                        old_n = int(lm.group(2))
-                        new_n = old_n + 2
-                        lines[j] = f"{lm.group(1)}{new_n}\n"
-                        r0, r1 = f"v{old_n}", f"v{old_n + 1}"
-                        hook = [
-                            f'    const-string {r0}, "{cls_name}"\n',
-                            f'    const-string {r1}, "{method}"\n',
-                            f'    invoke-static {{{r0}, {r1}}}, '
-                            f'{self.BRIDGE_CLS}->onLifecycle('
-                            f'Ljava/lang/String;Ljava/lang/String;)V\n',
-                        ]
+                    if re.match(r"[ \t]+\.locals\s+\d+", lines[j]):
                         for k, hl in enumerate(hook):
                             lines.insert(j + 1 + k, hl)
                         changed = True
@@ -3383,20 +5018,22 @@ class InstrumentationInjector:
                     i += 1; continue
                 mname_m = re.search(r"\s(\w+)\(", lines[i])
                 mname   = mname_m.group(1) if mname_m else "unknown"
+                end_idx = next((k for k in range(i + 1, len(lines))
+                                if lines[k].strip() == ".end method"), None)
+                scan_end = end_idx if end_idx else min(i + 60, len(lines))
+                r0, _ = self._bump_and_get_pair(lines, i, scan_end)
+                if r0 is None:
+                    i += 1; continue
+                r1 = r0 + 1
+                hook = [
+                    f'    const-string v{r0}, "{cls_name}"\n',
+                    f'    const-string v{r1}, "SENSITIVE:{mname}"\n',
+                    f'    invoke-static {{v{r0}, v{r1}}}, '
+                    f'{self.BRIDGE_CLS}->onLifecycle('
+                    f'Ljava/lang/String;Ljava/lang/String;)V\n',
+                ]
                 for j in range(i + 1, min(i + 12, len(lines))):
-                    lm = re.match(r"([ \t]+\.locals\s+)(\d+)", lines[j])
-                    if lm:
-                        old_n = int(lm.group(2))
-                        new_n = old_n + 2
-                        lines[j] = f"{lm.group(1)}{new_n}\n"
-                        r0, r1 = f"v{old_n}", f"v{old_n + 1}"
-                        hook = [
-                            f'    const-string {r0}, "{cls_name}"\n',
-                            f'    const-string {r1}, "SENSITIVE:{mname}"\n',
-                            f'    invoke-static {{{r0}, {r1}}}, '
-                            f'{self.BRIDGE_CLS}->onLifecycle('
-                            f'Ljava/lang/String;Ljava/lang/String;)V\n',
-                        ]
+                    if re.match(r"[ \t]+\.locals\s+\d+", lines[j]):
                         for k, hl in enumerate(hook):
                             lines.insert(j + 1 + k, hl)
                         count += 1
@@ -3429,21 +5066,26 @@ class InstrumentationInjector:
             if METHOD_RE.search(lines[i]):
                 if any(m in lines[i] for m in (" abstract ", " native ", " bridge ")):
                     i += 1; continue
+                end_idx = next((k for k in range(i + 1, len(lines))
+                                if lines[k].strip() == ".end method"), None)
+                scan_end = end_idx if end_idx else min(i + 60, len(lines))
+                r0, _ = self._bump_and_get_pair(lines, i, scan_end)
+                if r0 is None:
+                    log("warn",
+                        f"Bridge: skip connect in {sf.name} L{i}: "
+                        "no free register pair in v0-v15", indent=2)
+                    i += 1; continue
+                r1 = r0 + 1
+                port_lit = f"0x{self.cfg.bridge_port:x}"
+                hook = [
+                    f'    const-string v{r0}, "127.0.0.1"\n',
+                    f'    const/16 v{r1}, {port_lit}\n',
+                    f'    invoke-static {{v{r0}, v{r1}}}, '
+                    f'{self.BRIDGE_CLS}->connectBackground('
+                    f'Ljava/lang/String;I)V\n',
+                ]
                 for j in range(i + 1, min(i + 12, len(lines))):
-                    lm = re.match(r"([ \t]+\.locals\s+)(\d+)", lines[j])
-                    if lm:
-                        old_n = int(lm.group(2))
-                        new_n = old_n + 2
-                        lines[j] = f"{lm.group(1)}{new_n}\n"
-                        r0, r1 = f"v{old_n}", f"v{old_n + 1}"
-                        port_lit = f"0x{self.cfg.bridge_port:x}"
-                        hook = [
-                            f'    const-string {r0}, "127.0.0.1"\n',
-                            f'    const/16 {r1}, {port_lit}\n',
-                            f'    invoke-static {{{r0}, {r1}}}, '
-                            f'{self.BRIDGE_CLS}->connectBackground('
-                            f'Ljava/lang/String;I)V\n',
-                        ]
+                    if re.match(r"[ \t]+\.locals\s+\d+", lines[j]):
                         for k, hl in enumerate(hook):
                             lines.insert(j + 1 + k, hl)
                         _atomic_write(str(sf), lines)
@@ -3459,23 +5101,55 @@ class InstrumentationInjector:
         return result if result else [self.base / "smali"]
 
     def _find_app_entry(self) -> Path | None:
+        """
+        Locate the best smali file to inject connectBackground() into.
+        Priority:
+          1. android:name Application class from manifest (best)
+          2. MAIN/LAUNCHER activity from manifest
+          3. Any smali extending Application in all smali dirs (Unity fallback)
+          4. Any smali extending UnityPlayerActivity or GameActivity
+        """
         manifest = self.base / "AndroidManifest.xml"
-        if not manifest.is_file():
-            return None
-        mt = manifest.read_text(encoding="utf-8", errors="ignore")
-        # Try Application class first
-        m = re.search(r'<application[^>]+android:name="([^"]+)"', mt)
-        if m:
-            p = self._resolve_class(m.group(1))
-            if p:
-                return p
-        # Fall back to MAIN activity
-        m = re.search(
-            r'<activity[^>]+android:name="([^"]+)"', mt)
-        if m:
-            p = self._resolve_class(m.group(1))
-            if p:
-                return p
+        if manifest.is_file():
+            mt = manifest.read_text(encoding="utf-8", errors="ignore")
+            # 1. Application subclass
+            m = re.search(r'<application[^>]+android:name="([^"]+)"', mt)
+            if m:
+                p = self._resolve_class(m.group(1))
+                if p:
+                    return p
+            # 2. All activities in manifest – try each until one resolves
+            for m in re.finditer(r'<activity[^>]+android:name="([^"]+)"', mt):
+                p = self._resolve_class(m.group(1))
+                if p:
+                    return p
+
+        # 3. Scan smali dirs for any class that extends Application
+        _APP_SUPER_RE = re.compile(
+            r"\.super\s+Landroid/app/Application;|"
+            r"\.super\s+Landroidx/multidex/MultiDexApplication;|"
+            r"\.super\s+Landroid/app/Application"
+        )
+        _UNITY_SUPER_RE = re.compile(
+            r"\.super\s+Lcom/unity3d/player/UnityPlayer(?:Activity|GameActivity)?;"
+            r"|\.super\s+Lcom/unity3d/player/GameActivity;"
+        )
+        candidates = []
+        for sdir in self._smali_dirs():
+            for sf in sdir.rglob("*.smali"):
+                try:
+                    txt = sf.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if _APP_SUPER_RE.search(txt):
+                    candidates.insert(0, sf)   # Application subclass takes priority
+                elif _UNITY_SUPER_RE.search(txt):
+                    candidates.append(sf)       # Unity activity as fallback
+        if candidates:
+            log("info",
+                f"Bridge: using fallback entry point: {candidates[0].name}",
+                indent=1)
+            return candidates[0]
         return None
 
     def _resolve_class(self, cls: str) -> Path | None:
@@ -3486,19 +5160,12 @@ class InstrumentationInjector:
                 return p
         return None
 
-    @staticmethod
-    def _bump_locals_get_free_reg(lines: list[str], method_start: int,
+    def _bump_locals_get_free_reg(self, lines: list[str], method_start: int,
                                    target: int) -> str:
-        """Bump .locals by 1 in the enclosing method and return the new register."""
-        for j in range(method_start + 1, min(method_start + 12, len(lines))):
-            lm = re.match(r"([ \t]+\.locals\s+)(\d+)", lines[j])
-            if lm:
-                old_n = int(lm.group(2))
-                lines[j] = f"{lm.group(1)}{old_n + 1}\n"
-                return f"v{old_n}"
-        # Fall back to a high register index if .locals not found
-        return "v15"
-
+        """Legacy shim → delegates to _bump_and_get_pair.
+        Returns '' if no free register found, else 'vN' for N in 0-15."""
+        r0, _ = self._bump_and_get_pair(lines, method_start, target)
+        return f"v{r0}" if r0 is not None else ""
 # ──────────────────────────────────────────────────────────────────────────────
 #  BridgeServer  –  TCP event receiver (APK → UnGuard)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3510,9 +5177,11 @@ class BridgeServer:
     Each JSON line:  {"t":"TAG","d":"<escaped-json-string>"}
     Tags: NET / LC / ST / EX
     """
-    def __init__(self, port: int, on_event: _Callable[[dict], None]):
-        self.port     = port
-        self.on_event = on_event
+    def __init__(self, port: int, on_event: _Callable[[dict], None],
+                 bind_host: str = "127.0.0.1"):
+        self.port      = port
+        self.bind_host = bind_host
+        self.on_event  = on_event
         self._srv: _socket.socket | None = None
         self._stop    = threading.Event()
         self._thread: threading.Thread | None = None
@@ -3522,20 +5191,27 @@ class BridgeServer:
         self._srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         self._srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
         try:
-            self._srv.bind(("0.0.0.0", self.port))
+            self._srv.bind((self.bind_host, self.port))
         except OSError as e:
-            log("err", f"Bridge: cannot bind port {self.port}: {e}")
+            log("err", f"Bridge: cannot bind {self.bind_host}:{self.port}: {e}")
             raise
         self._srv.listen(8)
         self._srv.settimeout(1.0)
         self._thread = threading.Thread(
             target=self._accept_loop, name="UGBridgeSrv", daemon=True)
         self._thread.start()
-        log("ok",  f"Bridge server listening on 0.0.0.0:{self.port}")
-        log("info","  Termux: connect device to PC and run  "
-                   f"adb forward tcp:{self.port} tcp:{self.port}", indent=1)
-        log("info", "  Emulator / same device: bridge connects to 127.0.0.1 automatically.",
-            indent=1)
+        log("ok",  f"Bridge server listening on {self.bind_host}:{self.port}")
+        if self.bind_host == "127.0.0.1":
+            log("info",
+                f"  Forward from device: adb forward tcp:{self.port} tcp:{self.port}",
+                indent=1)
+            log("info",
+                "  Or use --bridge-bind 0.0.0.0 if device and PC share LAN "
+                "(less secure).", indent=1)
+        else:
+            log("warn",
+                f"  Bridge bound to {self.bind_host} – accessible from entire "
+                f"local network. Ensure firewall rules are in place.", indent=1)
 
     def stop(self):
         self._stop.set()
@@ -4175,7 +5851,15 @@ def _print_runtime_instructions(cfg: RuntimeConfig, final_apk: str | None):
                 f"  6. Rules file: {cfg.rules_file}  (use with --hybrid next run)",
                 indent=1)
 
-    if not cfg.needs_bridge and not cfg.tls_intercept:
+    if cfg.fake_google_verify:
+        log("info", "Fake Google Verify mode:")
+        log("info", "  Interceptor will return hardcoded success for requests to:", indent=1)
+        log("info", "    * play.googleapis.com", indent=2)
+        log("info", "    * androidpublisher", indent=2)
+        log("info", "    * licensing", indent=2)
+        log("info", "  Modify the JSON payload in UGNetInterceptor.smali if needed.", indent=1)
+
+    if not cfg.needs_bridge and not cfg.tls_intercept and not cfg.fake_google_verify:
         log("info", "Static-only mode: install and run the patched APK normally.")
         log("info", f"  adb install -r \"{apk}\"", indent=1)
 
@@ -4239,9 +5923,10 @@ def main():
         "  python unguard.py app.apk --patch all --net-debug\n"
         "  python unguard.py app.apk --patch all --trace-runtime\n"
         "  python unguard.py app.apk --patch all --tls-intercept\n"
+        "  python unguard.py app.apk --patch all --fake-google-verify\n"
         "  python unguard.py app.apk --patch all --learn\n"
         "  python unguard.py app.apk --patch all --hybrid\n"
-        "  python unguard.py app.apk --patch all --learn --net-debug\n"
+        "  python unguard.py app.apk --patch all --learn --net-debug --fake-google-verify\n"
         "  python unguard.py app.apk --patch all --hybrid --tls-intercept\n"
         "  (bridge port) adb forward tcp:17185 tcp:17185\n"
         ),
@@ -4294,6 +5979,9 @@ def main():
         help=f"Thread count          (env: MAX_WORKERS, default: {MAX_WORKERS})")
 
     fg = parser.add_argument_group("Flags")
+    fg.add_argument("--merge-splits", action="store_true", default=False,
+        help="Merge base + split APKs into one installable APK. "
+             "Copies lib/ and assets/ from each split into base, then re-signs.")
     fg.add_argument("--no-sign",     action="store_true",
         help="Output unsigned APK (APK mode only)")
     fg.add_argument("--no-deob",     action="store_true",
@@ -4310,6 +5998,9 @@ def main():
     rg.add_argument("--tls-intercept", action="store_true",
         help="Disable certificate pinning via NSC injection. "
              "Use with Burp/mitmproxy on --proxy-port.")
+    rg.add_argument("--fake-google-verify", action="store_true",
+        help="Intercept Google validation requests (licensing, purchase verify) "
+             "and return a hardcoded success response. Works with --tls-intercept.")
     rg.add_argument("--learn", action="store_true",
         help="Observe app behaviour and save a profile to --profile-db. "
              "Auto-discovers premium gates, analytics, storage tokens.")
@@ -4317,15 +6008,32 @@ def main():
         help="Apply rules from a previous --learn session as static patches.")
     rg.add_argument("--net-debug", action="store_true",
         help="Stream all OkHttp network requests/responses to console.")
-    rg.add_argument("--bridge-port", type=int, default=17185, metavar="PORT",
+    def _valid_port(v):
+        try:
+            p = int(v)
+            if 1 <= p <= 65535: return p
+        except ValueError: pass
+        raise argparse.ArgumentTypeError(f"Port must be 1-65535, got: {v!r}")
+
+    rg.add_argument("--bridge-port", type=_valid_port, default=17185, metavar="PORT",
         help="TCP port for the APK→UnGuard event bridge. "
              "Default 17185. Run: adb forward tcp:PORT tcp:PORT")
-    rg.add_argument("--proxy-port", type=int, default=8080, metavar="PORT",
+    rg.add_argument("--proxy-port", type=_valid_port, default=8080, metavar="PORT",
         help="Local proxy port for TLS intercept (mitmproxy/Burp). Default 8080.")
     rg.add_argument("--profile-db", default="unguard_profile.db", metavar="FILE",
         help="SQLite profile database path (--learn / --hybrid).")
     rg.add_argument("--rules-file", default="unguard_rules.json", metavar="FILE",
         help="JSON rules file path (--learn writes, --hybrid reads).")
+    rg.add_argument("--bridge-bind", default="127.0.0.1", metavar="HOST",
+        help="Bridge server bind address. Default 127.0.0.1 (secure). "
+             "Use 0.0.0.0 for Termux when bridging from a PC over USB adb forward.")
+
+    ig = parser.add_argument_group("Device (optional)")
+    ig.add_argument("--install", action="store_true",
+        help="After build, install the patched APK (and splits) on connected "
+             "Android device via adb. Uses adb install or adb install-multiple.")
+    ig.add_argument("--adb", default="adb", metavar="PATH",
+        help="Path to adb binary (default: adb from PATH).")
 
     args = parser.parse_args()
 
@@ -4407,14 +6115,16 @@ def main():
         learn         = getattr(args, "learn",         False),
         hybrid        = getattr(args, "hybrid",        False),
         net_debug     = getattr(args, "net_debug",     False),
+        fake_google_verify = getattr(args, "fake_google_verify", False),
         bridge_port   = getattr(args, "bridge_port",   17185),
         proxy_port    = getattr(args, "proxy_port",    8080),
         profile_db    = getattr(args, "profile_db",    "unguard_profile.db"),
         rules_file    = getattr(args, "rules_file",    "unguard_rules.json"),
+        bridge_bind   = getattr(args, "bridge_bind",   "127.0.0.1"),
     )
     if rt_cfg.any_runtime:
         active = [f for f in ("trace_runtime","tls_intercept","learn",
-                               "hybrid","net_debug") if getattr(rt_cfg, f)]
+                               "hybrid","net_debug","fake_google_verify") if getattr(rt_cfg, f)]
         log("ok",
             f"Runtime modules active: {C.BD}{', '.join(active)}{C.RS}")
     if rt_cfg.hybrid and not os.path.isfile(rt_cfg.rules_file):
@@ -4435,15 +6145,45 @@ def main():
     ok = False
     try:
         results = patcher.run(
-            patches     = patches,
-            detect_only = args.detect_only,
-            report_path = args.report,
+            patches      = patches,
+            detect_only  = args.detect_only,
+            report_path  = args.report,
+            merge_splits = getattr(args, "merge_splits", False),
         )
         if args.detect_only:
             ok = bool(results)
         else:
             out = results.get("output")
             ok  = bool(out and os.path.exists(out))
+            # ── --install: push patched APK(s) to device via adb ─────────
+            if ok and getattr(args, "install", False):
+                adb_bin = getattr(args, "adb", "adb")
+                # Find any re-signed splits in output dir
+                signed_splits = [
+                    os.path.join(patcher.output_dir,
+                                 os.path.splitext(os.path.basename(sp))[0]
+                                 + "_resigned.apk")
+                    for sp in patcher.split_apks
+                ]
+                signed_splits = [s for s in signed_splits if os.path.isfile(s)]
+                if signed_splits:
+                    cmd = [adb_bin, "install-multiple", "-r", out] + signed_splits
+                    label_str = f"base + {len(signed_splits)} split(s)"
+                else:
+                    cmd = [adb_bin, "install", "-r", out]
+                    label_str = "base APK"
+                log("info", f"Installing {label_str} via adb…")
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    if r.returncode == 0:
+                        log("ok", "adb install SUCCESS")
+                    else:
+                        log("err", f"adb install failed: {r.stderr.strip()[:300]}")
+                except FileNotFoundError:
+                    log("err",
+                        f"adb not found at '{adb_bin}'. Install Android SDK platform-tools.")
+                except subprocess.TimeoutExpired:
+                    log("err", "adb install timed out (120s).")
     except KeyboardInterrupt:
         log("warn", "Interrupted.")
     finally:
