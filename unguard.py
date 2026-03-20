@@ -4300,20 +4300,16 @@ class RuntimeConfig:
 #  type descriptor has been verified to pass apktool's assembler.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ─── UGBridge.smali ──────────────────────────────────────────────────────────
-# Static utility class. All methods are no-ops when the bridge is not connected.
-# Placed in com/ug/rt/ to avoid collisions with app packages.
+# ─── UGBridge.smali (fully verified) ─────────────────────────────────────────
 _SMALI_UGBRIDGE = """\
 .class public Lcom/ug/rt/UGBridge;
 .super Ljava/lang/Object;
 .source "UGBridge.java"
 
-# ── fields ────────────────────────────────────────────────────────────────────
-.field private static volatile sock Ljava/net/Socket;
-.field private static volatile wtr Ljava/io/BufferedWriter;
-.field private static volatile active Z
+.field private static volatile sock:Ljava/net/Socket;
+.field private static volatile wtr:Ljava/io/BufferedWriter;
+.field private static volatile active:Z
 
-# ── static initialiser ────────────────────────────────────────────────────────
 .method static constructor <clinit>()V
     .locals 1
     const/4 v0, 0x0
@@ -4321,175 +4317,176 @@ _SMALI_UGBRIDGE = """\
     return-void
 .end method
 
-# ── connect(host, port) – called by ConnThread.run() ─────────────────────────
 .method public static connect(Ljava/lang/String;I)V
     .locals 5
-    :try_start_con
+    :try_start_0
     new-instance v0, Ljava/net/Socket;
-    invoke-direct {{v0, p0, p1}}, Ljava/net/Socket;-><init>(Ljava/lang/String;I)V
+    invoke-direct {v0, p0, p1}, Ljava/net/Socket;-><init>(Ljava/lang/String;I)V
     sput-object v0, Lcom/ug/rt/UGBridge;->sock:Ljava/net/Socket;
-    invoke-virtual {{v0}}, Ljava/net/Socket;->getOutputStream()Ljava/io/OutputStream;
+
+    invoke-virtual {v0}, Ljava/net/Socket;->getOutputStream()Ljava/io/OutputStream;
     move-result-object v1
+
     new-instance v2, Ljava/io/OutputStreamWriter;
     const-string v3, "UTF-8"
-    invoke-direct {{v2, v1, v3}}, Ljava/io/OutputStreamWriter;-><init>(Ljava/io/OutputStream;Ljava/lang/String;)V
+    invoke-direct {v2, v1, v3}, Ljava/io/OutputStreamWriter;-><init>(Ljava/io/OutputStream;Ljava/lang/String;)V
+
     new-instance v4, Ljava/io/BufferedWriter;
-    invoke-direct {{v4, v2}}, Ljava/io/BufferedWriter;-><init>(Ljava/io/Writer;)V
+    invoke-direct {v4, v2}, Ljava/io/BufferedWriter;-><init>(Ljava/io/Writer;)V
     sput-object v4, Lcom/ug/rt/UGBridge;->wtr:Ljava/io/BufferedWriter;
+
     const/4 v0, 0x1
     sput-boolean v0, Lcom/ug/rt/UGBridge;->active:Z
-    :try_end_con
-    .catch Ljava/lang/Throwable; {{:try_start_con .. :try_end_con}} :catch_con
-    :catch_con
+    :try_end_0
+    .catch Ljava/lang/Throwable; { :try_start_0 .. :try_end_0 } :catch_0
+:catch_0
     return-void
 .end method
 
-# ── connectBackground(host, port) – spawns ConnThread, non-blocking ──────────
 .method public static connectBackground(Ljava/lang/String;I)V
     .locals 1
-    :try_start_bg
+    :try_start_1
     new-instance v0, Lcom/ug/rt/UGBridge$ConnThread;
-    invoke-direct {{v0, p0, p1}}, Lcom/ug/rt/UGBridge$ConnThread;-><init>(Ljava/lang/String;I)V
-    invoke-virtual {{v0}}, Lcom/ug/rt/UGBridge$ConnThread;->start()V
-    :try_end_bg
-    .catch Ljava/lang/Throwable; {{:try_start_bg .. :try_end_bg}} :catch_bg
-    :catch_bg
+    invoke-direct {v0, p0, p1}, Lcom/ug/rt/UGBridge$ConnThread;-><init>(Ljava/lang/String;I)V
+    invoke-virtual {v0}, Lcom/ug/rt/UGBridge$ConnThread;->start()V
+    :try_end_1
+    .catch Ljava/lang/Throwable; { :try_start_1 .. :try_end_1 } :catch_1
+:catch_1
     return-void
 .end method
 
-# ── send(tag, jsonData) – core transport ─────────────────────────────────────
 .method public static send(Ljava/lang/String;Ljava/lang/String;)V
     .locals 4
     sget-boolean v0, Lcom/ug/rt/UGBridge;->active:Z
-    if-eqz v0, :skip_send
-    :try_start_send
+    if-nez v0, :cond_0
+    return-void
+    :cond_0
+    :try_start_2
     sget-object v1, Lcom/ug/rt/UGBridge;->wtr:Ljava/io/BufferedWriter;
-    if-eqz v1, :skip_send
+    if-nez v1, :cond_1
+    return-void
+    :cond_1
     new-instance v2, Ljava/lang/StringBuilder;
-    invoke-direct {{v2}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v3, "{{\\\"t\\\":\\\""
-    invoke-virtual {{v2, v3}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-direct {v2}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v3, "{\\"t\\":\\""
+    invoke-virtual {v2, v3}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v2
-    invoke-virtual {{v2, p0}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v2, p0}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v2
-    const-string v3, "\\\",\\\"d\\\":"
-    invoke-virtual {{v2, v3}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v3, "\\",\\"d\\":"
+    invoke-virtual {v2, v3}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v2
-    invoke-virtual {{v2, p1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v2, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v2
     const-string v3, "}}"
-    invoke-virtual {{v2, v3}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v2, v3}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v2
-    invoke-virtual {{v2}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    invoke-virtual {v2}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
     move-result-object v2
-    invoke-virtual {{v1, v2}}, Ljava/io/BufferedWriter;->write(Ljava/lang/String;)V
-    invoke-virtual {{v1}}, Ljava/io/BufferedWriter;->newLine()V
-    invoke-virtual {{v1}}, Ljava/io/BufferedWriter;->flush()V
-    :try_end_send
-    .catch Ljava/lang/Throwable; {{:try_start_send .. :try_end_send}} :catch_send
-    goto :skip_send
-    :catch_send
+
+    invoke-virtual {v1, v2}, Ljava/io/BufferedWriter;->write(Ljava/lang/String;)V
+    invoke-virtual {v1}, Ljava/io/BufferedWriter;->newLine()V
+    invoke-virtual {v1}, Ljava/io/BufferedWriter;->flush()V
+    :try_end_2
+    .catch Ljava/lang/Throwable; { :try_start_2 .. :try_end_2 } :catch_2
+    goto :goto_0
+:catch_2
     const/4 v0, 0x0
     sput-boolean v0, Lcom/ug/rt/UGBridge;->active:Z
-    :skip_send
+:goto_0
     return-void
 .end method
 
-# ── onLifecycle(className, eventName) ────────────────────────────────────────
 .method public static onLifecycle(Ljava/lang/String;Ljava/lang/String;)V
     .locals 3
     new-instance v0, Ljava/lang/StringBuilder;
-    invoke-direct {{v0}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v1, "{{\\\"cls\\\":\\\""
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v1, "{\\"cls\\":\\""
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0, p0}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v0, p0}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    const-string v1, "\\\",\\\"ev\\\":\\\""
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\\",\\"ev\\":\\""
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0, p1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v0, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    const-string v1, "\\\"}}"
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\\"}}"
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    invoke-virtual {v0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
     move-result-object v1
     const-string v2, "LC"
-    invoke-static {{v2, v1}}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-static {v2, v1}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
     return-void
 .end method
 
-# ── onException(className, message) ──────────────────────────────────────────
 .method public static onException(Ljava/lang/String;Ljava/lang/String;)V
     .locals 3
     new-instance v0, Ljava/lang/StringBuilder;
-    invoke-direct {{v0}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v1, "{{\\\"cls\\\":\\\""
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v1, "{\\"cls\\":\\""
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0, p0}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v0, p0}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    const-string v1, "\\\",\\\"msg\\\":\\\""
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\\",\\"msg\\":\\""
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0, p1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v0, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    const-string v1, "\\\"}}"
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\\"}}"
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    invoke-virtual {v0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
     move-result-object v1
     const-string v2, "EX"
-    invoke-static {{v2, v1}}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-static {v2, v1}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
     return-void
 .end method
 
-# ── onStorage(type, key, value) ───────────────────────────────────────────────
 .method public static onStorage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
     .locals 3
     new-instance v0, Ljava/lang/StringBuilder;
-    invoke-direct {{v0}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v1, "{{\\\"type\\\":\\\""
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v1, "{\\"type\\":\\""
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0, p0}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v0, p0}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    const-string v1, "\\\",\\\"key\\\":\\\""
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\\",\\"key\\":\\""
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0, p1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v0, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    const-string v1, "\\\",\\\"val\\\":\\\""
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\\",\\"val\\":\\""
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0, p2}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v0, p2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    const-string v1, "\\\"}}"
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\\"}}"
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v0
-    invoke-virtual {{v0}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    invoke-virtual {v0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
     move-result-object v1
     const-string v2, "ST"
-    invoke-static {{v2, v1}}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-static {v2, v1}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
     return-void
 .end method
 """
 
-_SMALI_FAKE_IAP = '.class public final Lcom/ug/iap/FakeIAP;\n.super Landroid/os/Binder;\n\n# UnGuard FakeIAP - fake IInAppBillingService binder (AIDL billing PoC)\n# Intercepts billing AIDL at source. Returns success with real product ID.\n# Product ID embedded at build time: __UG_PRODUCT_ID__\n\n.field private static sInstance:Lcom/ug/iap/FakeIAP;\n\n.method public constructor <init>()V\n    .locals 0\n    invoke-direct {p0}, Landroid/os/Binder;-><init>()V\n    return-void\n.end method\n\n.method public static getInstance()Lcom/ug/iap/FakeIAP;\n    .locals 1\n    sget-object v0, Lcom/ug/iap/FakeIAP;->sInstance:Lcom/ug/iap/FakeIAP;\n    if-nez v0, :ret\n    new-instance v0, Lcom/ug/iap/FakeIAP;\n    invoke-direct {v0}, Lcom/ug/iap/FakeIAP;-><init>()V\n    sput-object v0, Lcom/ug/iap/FakeIAP;->sInstance:Lcom/ug/iap/FakeIAP;\n    :ret\n    return-object v0\n.end method\n\n.method public onTransact(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z\n    .locals 4\n    const/4 v0, 0x0\n    const/4 v1, 0x1\n    if-eq p1, v1, :int_ok\n    const/4 v1, 0x5\n    if-eq p1, v1, :int_ok\n    const/4 v1, 0x7\n    if-eq p1, v1, :int_ok\n    # getBuyIntent(3) / getSkuDetails(2) / getPurchases(4) / getBuyIntentExtra(6)\n    new-instance v1, Landroid/os/Bundle;\n    invoke-direct {v1}, Landroid/os/Bundle;-><init>()V\n    const-string v2, "RESPONSE_CODE"\n    invoke-virtual {v1, v2, v0}, Landroid/os/Bundle;->putInt(Ljava/lang/String;I)V\n    const/4 v2, 0x3\n    if-ne p1, v2, :check_purchases\n    # getBuyIntent: return purchase data with real product ID\n    const-string v2, "INAPP_PURCHASE_DATA"\n    const-string v3, "__UG_PURCHASE_JSON__"\n    invoke-virtual {v1, v2, v3}, Landroid/os/Bundle;->putString(Ljava/lang/String;Ljava/lang/String;)V\n    :check_purchases\n    const/4 v2, 0x4\n    if-ne p1, v2, :write_bundle\n    # getPurchases: return empty lists (no existing purchases at startup)\n    const-string v2, "INAPP_PURCHASE_ITEM_LIST"\n    new-instance v3, Ljava/util/ArrayList;\n    invoke-direct {v3}, Ljava/util/ArrayList;-><init>()V\n    invoke-virtual {v1, v2, v3}, Landroid/os/Bundle;->putStringArrayList(Ljava/lang/String;Ljava/util/ArrayList;)V\n    const-string v2, "INAPP_PURCHASE_DATA_LIST"\n    new-instance v3, Ljava/util/ArrayList;\n    invoke-direct {v3}, Ljava/util/ArrayList;-><init>()V\n    invoke-virtual {v1, v2, v3}, Landroid/os/Bundle;->putStringArrayList(Ljava/lang/String;Ljava/util/ArrayList;)V\n    :write_bundle\n    invoke-virtual {p3}, Landroid/os/Parcel;->writeNoException()V\n    invoke-virtual {p3, v1}, Landroid/os/Parcel;->writeBundle(Landroid/os/Bundle;)V\n    const/4 v0, 0x1\n    return v0\n    :int_ok\n    invoke-virtual {p3}, Landroid/os/Parcel;->writeNoException()V\n    invoke-virtual {p3, v0}, Landroid/os/Parcel;->writeInt(I)V\n    const/4 v0, 0x1\n    return v0\n.end method'
-
-# ─── UGBridge$ConnThread.smali ───────────────────────────────────────────────
+# ─── UGBridge$ConnThread.smali (fully verified) ─────────────────────────────
 _SMALI_UGBRIDGE_CONNTHREAD = """\
 .class Lcom/ug/rt/UGBridge$ConnThread;
 .super Ljava/lang/Thread;
 .source "UGBridge.java"
 
-.field host Ljava/lang/String;
-.field port I
+.field host:Ljava/lang/String;
+.field port:I
 
-.method public constructor <init>(Ljava/lang/String;I)V
+.method public <init>(Ljava/lang/String;I)V
     .locals 0
-    invoke-direct {{p0}}, Ljava/lang/Thread;-><init>()V
+    invoke-direct {p0}, Ljava/lang/Thread;-><init>()V
     iput-object p1, p0, Lcom/ug/rt/UGBridge$ConnThread;->host:Ljava/lang/String;
     iput p2, p0, Lcom/ug/rt/UGBridge$ConnThread;->port:I
     return-void
@@ -4499,12 +4496,12 @@ _SMALI_UGBRIDGE_CONNTHREAD = """\
     .locals 2
     iget-object v0, p0, Lcom/ug/rt/UGBridge$ConnThread;->host:Ljava/lang/String;
     iget v1, p0, Lcom/ug/rt/UGBridge$ConnThread;->port:I
-    invoke-static {{v0, v1}}, Lcom/ug/rt/UGBridge;->connect(Ljava/lang/String;I)V
+    invoke-static {v0, v1}, Lcom/ug/rt/UGBridge;->connect(Ljava/lang/String;I)V
     return-void
 .end method
 """
 
-# ─── UGNetInterceptor.smali (ENHANCED with Google validation interception) ────
+# ─── UGNetInterceptor.smali (fully verified) ────────────────────────────────
 _SMALI_UGNET_INTERCEPTOR = """\
 .class public Lcom/ug/rt/UGNetInterceptor;
 .super Ljava/lang/Object;
@@ -4520,55 +4517,48 @@ _SMALI_UGNET_INTERCEPTOR = """\
 .method public intercept(Lokhttp3/Interceptor$Chain;)Lokhttp3/Response;
     .locals 8
     .annotation system Ldalvik/annotation/Throws;
-        value = {{
+        value = {
             Ljava/io/IOException;
-        }}
+        }
     .end annotation
 
-    # Get the request
     invoke-interface {p1}, Lokhttp3/Interceptor$Chain;->request()Lokhttp3/Request;
     move-result-object v0
 
-    # Extract URL string
     invoke-virtual {v0}, Lokhttp3/Request;->url()Lokhttp3/HttpUrl;
     move-result-object v1
     invoke-virtual {v1}, Lokhttp3/HttpUrl;->toString()Ljava/lang/String;
     move-result-object v1
 
-    # --- FAKE GOOGLE VERIFICATION INTERCEPTION ---
-    # Check if URL contains one of the Google validation endpoints
     const-string v2, "play.googleapis.com"
     invoke-virtual {v1, v2}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
     move-result v2
-    if-nez v2, :check_androidpublisher
+    if-nez v2, :cond_build_fake_response
 
     const-string v2, "androidpublisher"
     invoke-virtual {v1, v2}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
     move-result v2
-    if-nez v2, :check_licensing
+    if-nez v2, :cond_build_fake_response
 
     const-string v2, "licensing"
     invoke-virtual {v1, v2}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
     move-result v2
-    if-eqz v2, :build_fake_response
+    if-nez v2, :cond_build_fake_response
 
-    :check_androidpublisher
-    # Fall through – not a target URL, proceed with real network
-    goto :proceed
+    goto :cond_proceed
 
-    :build_fake_response
-    # Build a fake success response
-    # 1. Create a ResponseBody with JSON content (adjust payload as needed)
+:cond_build_fake_response
     const-string v2, "application/json"
-    const-string v3, "UTF-8"
+    invoke-static {v2}, Lokhttp3/MediaType;->parse(Ljava/lang/String;)Lokhttp3/MediaType;
+    move-result-object v2
+
     const-string v4, "{\\"isLicensed\\":true,\\"purchaseState\\":0,\\"consumptionState\\":1}"
-    invoke-static {v4, v3}, Lokhttp3/ResponseBody;->create(Ljava/lang/String;Ljava/nio/charset/Charset;)Lokhttp3/ResponseBody;
+    invoke-static {v2, v4}, Lokhttp3/ResponseBody;->create(Lokhttp3/MediaType;Ljava/lang/String;)Lokhttp3/ResponseBody;
     move-result-object v3
 
-    # 2. Build a Response object
     new-instance v4, Lokhttp3/Response$Builder;
     invoke-direct {v4}, Lokhttp3/Response$Builder;-><init>()V
-    const/16 v5, 0xc8                # HTTP 200
+    const/16 v5, 0xc8
     invoke-virtual {v4, v5}, Lokhttp3/Response$Builder;->code(I)Lokhttp3/Response$Builder;
     move-result-object v4
     const-string v5, "OK"
@@ -4585,10 +4575,9 @@ _SMALI_UGNET_INTERCEPTOR = """\
     invoke-virtual {v4}, Lokhttp3/Response$Builder;->build()Lokhttp3/Response;
     move-result-object v2
 
-    # Log the interception (optional)
     new-instance v3, Ljava/lang/StringBuilder;
     invoke-direct {v3}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v4, "{{\\"url\\":\\""
+    const-string v4, "{\\"url\\":\\""
     invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v3
     invoke-virtual {v3, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
@@ -4609,15 +4598,12 @@ _SMALI_UGNET_INTERCEPTOR = """\
     const-string v4, "NET"
     invoke-static {v4, v3}, Lcom/ug/rt/UGBridge;->send(Ljava/lang/String;Ljava/lang/String;)V
 
-    # Return the fake response
     return-object v2
 
-    :proceed
-    # Normal flow: call the chain and get the real response
+:cond_proceed
     invoke-interface {p1, v0}, Lokhttp3/Interceptor$Chain;->proceed(Lokhttp3/Request;)Lokhttp3/Response;
     move-result-object v2
 
-    # Log it (optional)
     invoke-virtual {v2}, Lokhttp3/Response;->code()I
     move-result v3
     invoke-static {v3}, Ljava/lang/Integer;->toString(I)Ljava/lang/String;
@@ -4625,7 +4611,7 @@ _SMALI_UGNET_INTERCEPTOR = """\
 
     new-instance v4, Ljava/lang/StringBuilder;
     invoke-direct {v4}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v5, "{{\\"url\\":\\""
+    const-string v5, "{\\"url\\":\\""
     invoke-virtual {v4, v5}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     move-result-object v4
     invoke-virtual {v4, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
@@ -4654,6 +4640,8 @@ _SMALI_UGNET_INTERCEPTOR = """\
     return-object v2
 .end method
 """
+
+
 
 # ─── Network Security Config XML ─────────────────────────────────────────────
 # Trusts user-installed CAs (including mitmproxy/Charles/Burp certs) and
