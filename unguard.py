@@ -3296,36 +3296,66 @@ class AndroidPatcher:
         FrameworkDetector.print_report(self._framework_info)
 
     def _merge_splits_into_base(self, base_apk: str, split_apks: list) -> str | None:
-        """Merge split APKs (arm64, density, language) into the base APK.
-        Copies lib/ and assets/ entries from each split into the base ZIP.
+        """Merge split APKs into the base APK.
+
+        Copies lib/, assets/, and DEX files (classes*.dex) from each split
+        into the base. DEX files from splits are renamed to avoid collisions:
+        classes.dex from a split becomes classesN.dex where N continues from
+        the highest existing index in the base.
         Returns path to merged signed APK, or None on failure.
         """
-        import zipfile as _zf, shutil as _sh
+        import zipfile as _zf, shutil as _sh, re as _re
         if not base_apk or not os.path.isfile(base_apk):
             return None
         try:
             out = base_apk.replace(".apk", "_merged.apk")
             _sh.copy2(base_apk, out)
             merged_entries = 0
+
             with _zf.ZipFile(out, "a", compression=_zf.ZIP_DEFLATED) as zout:
                 existing = set(zout.namelist())
+
+                # Find highest existing classes index in base
+                dex_indices = {0}  # classes.dex = index 0
+                for name in existing:
+                    m = _re.match(r"classes(\d+)\.dex", name)
+                    if m:
+                        dex_indices.add(int(m.group(1)))
+                next_dex = max(dex_indices) + 1
+
                 for split in split_apks:
-                    if not os.path.isfile(split): continue
+                    if not os.path.isfile(split):
+                        continue
                     with _zf.ZipFile(split, "r") as zsplit:
                         for entry in zsplit.infolist():
                             name = entry.filename
-                            if (name.startswith("lib/") or name.startswith("assets/")):
+
+                            # lib/ and assets/ — copy as-is
+                            if name.startswith("lib/") or name.startswith("assets/"):
                                 if name not in existing:
                                     zout.writestr(entry, zsplit.read(name))
                                     existing.add(name)
                                     merged_entries += 1
+
+                            # DEX files — rename to avoid collision
+                            elif _re.match(r"classes\d*\.dex$", name):
+                                new_name = f"classes{next_dex}.dex"
+                                data = zsplit.read(name)
+                                info = _zf.ZipInfo(new_name)
+                                info.compress_type = _zf.ZIP_DEFLATED
+                                zout.writestr(info, data)
+                                existing.add(new_name)
+                                next_dex += 1
+                                merged_entries += 1
+                                log("info", f"  Split DEX: {name} → {new_name}", indent=1)
+
             if merged_entries == 0:
                 try: os.unlink(out)
                 except: pass
-                log("info", "Splits had no lib/assets to merge.", indent=1)
+                log("info", "Splits had no mergeable entries.", indent=1)
                 return None
+
             log("ok", f"Merged {merged_entries} entries from {len(split_apks)} split(s).", indent=1)
-            # Re-sign the merged APK
             signed_out = self.sign(out, "merged")
             if signed_out and os.path.isfile(signed_out):
                 try: os.unlink(out)
@@ -3527,7 +3557,9 @@ class AndroidPatcher:
                         f" Decompiling {C.BD}{fname}{C.RS}…")
                     sys.stdout.flush()
                 time.sleep(0.15); i += 1
-        for extra in [["--no-res"], []]:
+        # Force full decode if TLS intercept is needed so AndroidManifest.xml is editable text
+        decode_modes = [[]] if self.runtime_cfg.tls_intercept else [["--no-res"], []]
+        for extra in decode_modes:
             t = threading.Thread(target=_spin, daemon=True); t.start()
             # Pass JAVA_OPTS if set (allows: JAVA_OPTS="-Xmx2g" for large APKs)
             java_opts = os.environ.get("JAVA_OPTS", "").split()
@@ -3774,44 +3806,69 @@ class AndroidPatcher:
             if sp_signed and os.path.isfile(sp_signed):
                 signed_splits.append(sp_signed)
 
-        final = os.path.join(self.output_dir, f"{base_name}_{slug}.apk")
+        # ── Determine final output path ───────────────────────────────────────
+        # --output-apk wins; else use output_dir
+        output_apk = getattr(self, "output_apk", None)
+        out_all    = getattr(self, "out_all", None)
+        default_name = f"{base_name}_{slug}.apk"
+        if output_apk:
+            final = os.path.abspath(output_apk)
+            os.makedirs(os.path.dirname(final) or ".", exist_ok=True)
+        else:
+            final = os.path.join(self.output_dir, default_name)
 
+        # ── Merge splits → single APK when splits present ────────────────────
+        merged_apk = None
         if signed_splits:
-            # ── Merge base + splits → single installable APK ─────────────────
-            # User gave a split archive as input; they expect ONE file back.
             log("info", f"Merging {len(signed_splits)} split(s) into base APK…")
-            merged = self._merge_splits_into_base(signed_base, signed_splits)
-            if merged and os.path.isfile(merged):
-                try:
-                    shutil.copy(merged, final)
-                    if merged != final:
-                        try: os.unlink(merged)
-                        except: pass
-                except shutil.SameFileError:
-                    final = merged
-                log("ok", f"Output (single APK): {C.G}{final}{C.RS}")
-                return final
-            # Merge failed – fall back to separate files + adb install-multiple
-            log("warn", "Merge failed – falling back to separate files.")
-            shutil.copy(signed_base, final)
-            log("ok", f"Output (base): {C.G}{final}{C.RS}")
-            split_outs: list[str] = []
+            merged_apk = self._merge_splits_into_base(signed_base, signed_splits)
+
+        # Pick what to copy to final destination
+        source_apk = merged_apk if (merged_apk and os.path.isfile(merged_apk)) else signed_base
+
+        try:
+            shutil.copy(source_apk, final)
+            if merged_apk and merged_apk != final:
+                try: os.unlink(merged_apk)
+                except: pass
+        except shutil.SameFileError:
+            final = source_apk
+
+        if merged_apk and os.path.isfile(final):
+            log("ok", f"Output (merged single APK): {C.G}{final}{C.RS}")
+        else:
+            log("ok", f"Output: {C.G}{final}{C.RS}")
+
+        # ── --out-all: copy base + splits + merged into a directory ───────────
+        if out_all:
+            os.makedirs(out_all, exist_ok=True)
+            # merged/base
+            shutil.copy(final, os.path.join(out_all, os.path.basename(final)))
+            log("ok", f"  [out-all] merged → {out_all}/", indent=1)
+            # original signed splits (re-signed)
             for sp in signed_splits:
-                sp_out = os.path.join(
-                    self.output_dir,
+                sp_dest = os.path.join(out_all,
+                    os.path.splitext(os.path.basename(sp))[0] + "_resigned.apk")
+                shutil.copy(sp, sp_dest)
+                log("ok", f"  [out-all] split  → {sp_dest}", indent=1)
+            # original signed base
+            base_dest = os.path.join(out_all, f"{base_name}_{slug}_base.apk")
+            shutil.copy(signed_base, base_dest)
+            log("ok", f"  [out-all] base   → {base_dest}", indent=1)
+
+        # ── Fallback install hint when merge failed ───────────────────────────
+        if signed_splits and not merged_apk:
+            log("warn", "Split merge failed – use adb install-multiple:")
+            split_outs = []
+            for sp in signed_splits:
+                sp_out = os.path.join(self.output_dir,
                     os.path.splitext(os.path.basename(sp))[0] + "_resigned.apk")
                 shutil.copy(sp, sp_out)
                 split_outs.append(sp_out)
-                log("ok", f"  Split: {sp_out}", indent=1)
-            adb_cmd = ("adb install-multiple " +
-                       " ".join(f'"{p}"' for p in [final] + split_outs))
-            log("ok", f"Install command:")
+            adb_cmd = "adb install-multiple " + " ".join(
+                f'"{p}"' for p in [final] + split_outs)
             log("info", f"  {adb_cmd}", indent=1)
-            return final
 
-        # ── No splits: single base APK ────────────────────────────────────────
-        shutil.copy(signed_base, final)
-        log("ok", f"Output: {C.G}{final}{C.RS}")
         return final
 
     # ── Main run ──────────────────────────────────────────────────────────────
@@ -4481,10 +4538,19 @@ _SMALI_UGBRIDGE_CONNTHREAD = """\
 .super Ljava/lang/Thread;
 .source "UGBridge.java"
 
+.annotation system Ldalvik/annotation/EnclosingClass;
+    value = Lcom/ug/rt/UGBridge;
+.end annotation
+
+.annotation system Ldalvik/annotation/InnerClass;
+    accessFlags = 0x0
+    name = "ConnThread"
+.end annotation
+
 .field host:Ljava/lang/String;
 .field port:I
 
-.method public <init>(Ljava/lang/String;I)V
+.method public constructor <init>(Ljava/lang/String;I)V
     .locals 0
     invoke-direct {p0}, Ljava/lang/Thread;-><init>()V
     iput-object p1, p0, Lcom/ug/rt/UGBridge$ConnThread;->host:Ljava/lang/String;
@@ -4866,14 +4932,22 @@ class InstrumentationInjector:
         # Patch AndroidManifest.xml to reference NSC (idempotent)
         manifest = self.base / "AndroidManifest.xml"
         if manifest.is_file():
-            mt = manifest.read_text(encoding="utf-8", errors="ignore")
-            if "networkSecurityConfig" not in mt:
-                mt = mt.replace(
-                    "<application",
-                    '<application android:networkSecurityConfig="@xml/network_security_config"',
-                    1)
-                _atomic_write(str(manifest), [mt])
-            log("ok", "TLS: network_security_config.xml injected + manifest updated.", indent=1)
+            # Safety check: Prevent overwriting compiled binary XML with string ops
+            with open(manifest, "rb") as f:
+                is_binary = f.read(4) == b"\x03\x00\x08\x00"
+
+            if is_binary:
+                log("warn", "AndroidManifest.xml is binary! Cannot inject TLS config. "
+                    "(Use --tls-intercept to force full decode)", indent=1)
+            else:
+                mt = manifest.read_text(encoding="utf-8", errors="ignore")
+                if "networkSecurityConfig" not in mt:
+                    mt = mt.replace(
+                        "<application",
+                        '<application android:networkSecurityConfig="@xml/network_security_config"',
+                        1)
+                    _atomic_write(str(manifest), [mt])
+                log("ok", "TLS: network_security_config.xml injected + manifest updated.", indent=1)
 
     # ── OkHttp interceptor injection ──────────────────────────────────────────
     def _inject_okhttp_interceptor(self) -> int:
@@ -5945,8 +6019,12 @@ def main():
     )
 
     og = parser.add_argument_group("Output")
-    og.add_argument("-o","--output", default=None, metavar="DIR",
-        help="Output directory (APK or smali mode)")
+    og.add_argument("-o", "--output", default=None, metavar="DIR",
+        help="Output directory for all produced files (default: current dir)")
+    og.add_argument("--output-apk", default=None, metavar="FILE.apk",
+        help="Write final merged/patched APK to this exact path")
+    og.add_argument("--out-all", default=None, metavar="DIR",
+        help="Copy base APK, all split APKs, and merged APK into this directory")
     og.add_argument("--work-dir", default=None, metavar="DIR",
         help="Override temp workspace directory (APK mode only)")
     og.add_argument("--report", default=None, metavar="FILE",
@@ -6129,6 +6207,8 @@ def main():
         workers     = MAX_WORKERS,
         runtime_cfg = rt_cfg,
     )
+    patcher.output_apk = getattr(args, "output_apk", None)
+    patcher.out_all    = getattr(args, "out_all", None)
 
     ok = False
     try:
