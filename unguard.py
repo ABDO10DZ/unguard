@@ -136,6 +136,12 @@ class Progress:
             n = self.current
         self._draw(n)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.done()
+
     def done(self, msg: str = ""):
         self._done_ev.set()          # stop heartbeat
         self._hb.join(timeout=1.0)
@@ -671,10 +677,9 @@ class SmaliCache:
         t0 = time.time()
         all_files = []
         for root, dirs, files in os.walk(str(self.base)):
-            # Prune non-smali dirs in-place so os.walk doesn't descend into them
-            rel_root = os.path.relpath(root, str(self.base))
-            if rel_root == ".":
-                dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS]
+            # Prune skip dirs at every level so os.walk never descends into them.
+            # e.g. smali/com/google/firebase/res/ inside a smali dir is rare but possible.
+            dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS]
             for fname in files:
                 if fname.endswith(".smali"):
                     all_files.append(os.path.join(root, fname))
@@ -704,6 +709,7 @@ class SmaliCache:
             futs = {ex.submit(_read, all_files[i]): i
                     for i in range(min(est_files_in_cap, total))}
             done = 0
+            cap_hit = False
             for fut in as_completed(futs):
                 idx_f = futs[fut]
                 rel   = rels[idx_f]
@@ -712,11 +718,16 @@ class SmaliCache:
                 except Exception:
                     content = ""
                 size = len(content.encode("utf-8", errors="ignore"))
-                if used_b + size <= cap_b:
+                if not cap_hit and used_b + size <= cap_b:
                     self._data[rel] = content
                     used_b += size
                 else:
                     capped += 1
+                    if not cap_hit:
+                        cap_hit = True
+                        # Cancel all not-yet-started futures to save I/O
+                        for f in futs:
+                            f.cancel()
                 done += 1
                 if pb and (done % 200 == 0 or done == total):
                     pb.update(done)
@@ -724,8 +735,8 @@ class SmaliCache:
         # Any files beyond est_files_in_cap are on-demand only
         for i in range(est_files_in_cap, total):
             capped += 1
-            if pb:
-                pb.update(min(est_files_in_cap + 1, total))
+        if pb:
+            pb.update(total)
         self._mem_mb = used_b / (1024 * 1024)
         if pb:
             pb.done(f"Loaded {total - capped}/{total} smali files "
@@ -1528,12 +1539,20 @@ class PatchEngine:
                     and "BillingResult" in (method.return_type or "")):
                 if not (method.is_abstract or method.is_native):
                     # Return pre-built OK BillingResult (zzcj.zzf has code=0).
-                    # Also call onPurchasesUpdated(OK, emptyList) so the app's
-                    # purchase listener fires immediately without Play Store dialog.
-                    # Build JSON string for fake Purchase - escape " as \" for smali
-                    _pj = ('{"orderId":"UG.bypass","packageName":"com.ug",'
-                           '"productIds":["bypass"],"purchaseState":0,'
-                           '"purchaseToken":"ug_token_bypass","acknowledged":true}')
+                    # Also call onPurchasesUpdated with a fake Purchase object so
+                    # the app's listener fires immediately without Play Store dialog.
+                    # Use a real product ID from the app if extractable.
+                    _prod_ids = sorted(self.extract_product_ids())
+                    _prod_id  = _prod_ids[0] if _prod_ids else "bypass"
+                    _pkg      = getattr(self, "package", "com.ug") or "com.ug"
+                    _pj = (
+                        '{"orderId":"UG.' + _prod_id + '",'
+                        '"packageName":"' + _pkg + '",'
+                        '"productIds":["' + _prod_id + '"],'
+                        '"purchaseState":0,'
+                        '"purchaseToken":"ug_tok_' + _prod_id + '",'
+                        '"acknowledged":true}'
+                    )
                     _pj_s = _pj.replace('"', '\\\"'  )   # " → \" in smali
                     nb = [
                         "    sget-object v0, Lcom/android/billingclient/api/zzcj;"
@@ -2929,7 +2948,12 @@ class FrameworkDetector:
     }
 
     @classmethod
-    def detect_from_dir(cls, decomp_dir: str) -> dict:
+    def detect_from_dir(cls, decomp_dir: str,
+                        cache: "SmaliCache | None" = None) -> dict:
+        """Detect engine from decompiled directory.
+        If `cache` is provided (already loaded SmaliCache), reuses in-memory
+        smali content instead of re-reading from disk – major speedup.
+        """
         found = defaultdict(list)
         base  = Path(decomp_dir)
 
@@ -2980,41 +3004,61 @@ class FrameworkDetector:
             except Exception:
                 pass
 
-        # 4. FIX: Smali class scan – no hard file cap; per-framework early stop
-        #    so we avoid scanning 50k files once all frameworks are identified.
-        compiled   = [(re.compile(p, re.IGNORECASE), fw) for p, fw in cls.SMALI_SIGS]
-        sm_lock    = threading.Lock()
-        sm_found   = defaultdict(list)
-        sm_seen: set[str] = set()
-        # Collect all smali files from ALL smali dirs (handles multi-dex)
-        sm_files: list[Path] = []
-        for smali_dir in base.glob("smali*"):
-            if smali_dir.is_dir():
-                sm_files.extend(smali_dir.rglob("*.smali"))
-        if not sm_files:
-            sm_files = list(base.rglob("*.smali"))
+        # 4. Smali class scan – uses SmaliCache if available (avoids re-reading disk)
+        compiled = [(re.compile(p, re.IGNORECASE), fw) for p, fw in cls.SMALI_SIGS]
+        sm_lock  = threading.Lock()
+        sm_found: dict[str, list[str]] = defaultdict(list)
+        sm_seen:  set[str] = set()
+        all_fw   = {fw for _, fw in cls.SMALI_SIGS}
 
-        all_fw = {fw for _, fw in cls.SMALI_SIGS}
-
-        def _smali_check(sf: Path):
-            # Fast exit if all frameworks already found
-            with sm_lock:
-                if sm_seen >= all_fw:
+        if cache is not None:
+            # Fast path: iterate cache in memory (no disk I/O at all)
+            items = list(cache.items())
+            def _smali_check_cached(item):
+                rel, text = item
+                if not text:
                     return
-            try:    text = sf.read_text(encoding="utf-8", errors="ignore")
-            except: return
-            for pat, fw in compiled:
                 with sm_lock:
-                    if fw in sm_seen:
-                        continue
-                if pat.search(text):
+                    if sm_seen.issuperset(all_fw):
+                        return
+                for pat, fw in compiled:
                     with sm_lock:
-                        sm_seen.add(fw)
-                        sm_found[fw].append(f"[smali] {sf.name}")
+                        if fw in sm_seen:
+                            continue
+                    if pat.search(text):
+                        with sm_lock:
+                            sm_seen.add(fw)
+                            sm_found[fw].append(f"[smali] {Path(rel).name}")
+            workers = min(MAX_WORKERS, 4)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_smali_check_cached, items))
+        else:
+            # Fallback: read from disk (used when no cache available)
+            sm_files: list[Path] = []
+            for smali_dir in base.glob("smali*"):
+                if smali_dir.is_dir():
+                    sm_files.extend(smali_dir.rglob("*.smali"))
+            if not sm_files:
+                sm_files = list(base.rglob("*.smali"))
 
-        workers = min(MAX_WORKERS, 4)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_smali_check, sm_files))
+            def _smali_check(sf: Path):
+                with sm_lock:
+                    if sm_seen.issuperset(all_fw):
+                        return
+                try:    text = sf.read_text(encoding="utf-8", errors="ignore")
+                except: return
+                for pat, fw in compiled:
+                    with sm_lock:
+                        if fw in sm_seen:
+                            continue
+                    if pat.search(text):
+                        with sm_lock:
+                            sm_seen.add(fw)
+                            sm_found[fw].append(f"[smali] {sf.name}")
+
+            workers = min(MAX_WORKERS, 4)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_smali_check, sm_files))
 
         for fw, sigs in sm_found.items():
             found[fw].extend(sigs)
@@ -3285,77 +3329,51 @@ class AndroidPatcher:
         else:
             log("info", "No framework signals in ZIP (may be split APK – will re-check post-decompile)")
 
-    def detect_engine_post_decompile(self):
+    def detect_engine_post_decompile(self, cache: "SmaliCache | None" = None):
+        """Pass `cache` if SmaliCache is already loaded to avoid re-reading disk."""
         if not self.decompiled or not os.path.isdir(self.decompiled):
             FrameworkDetector.print_report(self._framework_info)
             return
         log("info", "Detecting framework / engine (pass 2: decompiled dir)...")
-        for fw, sigs in FrameworkDetector.detect_from_dir(self.decompiled).items():
+        for fw, sigs in FrameworkDetector.detect_from_dir(
+                self.decompiled, cache=cache).items():
             self._framework_info[fw].extend(sigs)
         log("head", "Framework Detection Result")
         FrameworkDetector.print_report(self._framework_info)
 
     def _merge_splits_into_base(self, base_apk: str, split_apks: list) -> str | None:
-        """Merge split APKs into the base APK.
-
-        Copies lib/, assets/, and DEX files (classes*.dex) from each split
-        into the base. DEX files from splits are renamed to avoid collisions:
-        classes.dex from a split becomes classesN.dex where N continues from
-        the highest existing index in the base.
+        """Merge split APKs (arm64, density, language) into the base APK.
+        Copies lib/ and assets/ entries from each split into the base ZIP.
         Returns path to merged signed APK, or None on failure.
         """
-        import zipfile as _zf, shutil as _sh, re as _re
+        import zipfile as _zf, shutil as _sh
         if not base_apk or not os.path.isfile(base_apk):
             return None
         try:
             out = base_apk.replace(".apk", "_merged.apk")
             _sh.copy2(base_apk, out)
             merged_entries = 0
-
             with _zf.ZipFile(out, "a", compression=_zf.ZIP_DEFLATED) as zout:
                 existing = set(zout.namelist())
-
-                # Find highest existing classes index in base
-                dex_indices = {0}  # classes.dex = index 0
-                for name in existing:
-                    m = _re.match(r"classes(\d+)\.dex", name)
-                    if m:
-                        dex_indices.add(int(m.group(1)))
-                next_dex = max(dex_indices) + 1
-
                 for split in split_apks:
-                    if not os.path.isfile(split):
-                        continue
+                    if not os.path.isfile(split): continue
                     with _zf.ZipFile(split, "r") as zsplit:
                         for entry in zsplit.infolist():
                             name = entry.filename
-
-                            # lib/ and assets/ — copy as-is
-                            if name.startswith("lib/") or name.startswith("assets/"):
+                            if (name.startswith("lib/") or name.startswith("assets/")):
                                 if name not in existing:
                                     zout.writestr(entry, zsplit.read(name))
                                     existing.add(name)
                                     merged_entries += 1
-
-                            # DEX files — rename to avoid collision
-                            elif _re.match(r"classes\d*\.dex$", name):
-                                new_name = f"classes{next_dex}.dex"
-                                data = zsplit.read(name)
-                                info = _zf.ZipInfo(new_name)
-                                info.compress_type = _zf.ZIP_DEFLATED
-                                zout.writestr(info, data)
-                                existing.add(new_name)
-                                next_dex += 1
-                                merged_entries += 1
-                                log("info", f"  Split DEX: {name} → {new_name}", indent=1)
-
             if merged_entries == 0:
                 try: os.unlink(out)
                 except: pass
-                log("info", "Splits had no mergeable entries.", indent=1)
-                return None
-
+                log("info", "Splits had no lib/dex/assets to merge "
+                    "(density/language splits only — base APK is self-contained).",
+                    indent=1)
+                return base_apk   # base is already correct on its own
             log("ok", f"Merged {merged_entries} entries from {len(split_apks)} split(s).", indent=1)
+            # Re-sign the merged APK
             signed_out = self.sign(out, "merged")
             if signed_out and os.path.isfile(signed_out):
                 try: os.unlink(out)
@@ -3523,24 +3541,45 @@ class AndroidPatcher:
             log("warn", f"  Generic ZIP failed: {e}")
 
     def analyze_with_androguard(self):
-        if not _ANDROGUARD:
-            log("warn","androguard not installed – run bash installer.sh"); return
-        log("info","Androguard static analysis...")
-        import io, warnings
-        _old_stderr, sys.stderr = sys.stderr, io.StringIO()
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                a = _ag_apk.APK(self.target)
-            self.package = a.get_package()
-            log("ok", f"Package : {C.BD}{self.package}{C.RS}")
-            log("ok", f"SDK     : min={a.get_min_sdk_version()} "
-                       f"target={a.get_target_sdk_version()}")
-            log("ok", f"Perms   : {len(a.get_permissions())}")
-        except Exception as e:
-            log("warn", f"Androguard: {e}")
-        finally:
-            sys.stderr = _old_stderr
+        # Try androguard first (richest info)
+        if _ANDROGUARD:
+            log("info", "Androguard static analysis...")
+            import io, warnings
+            _old_stderr, sys.stderr = sys.stderr, io.StringIO()
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    a = _ag_apk.APK(self.target)
+                self.package = a.get_package()
+                log("ok", f"Package : {C.BD}{self.package}{C.RS}")
+                log("ok", f"SDK     : min={a.get_min_sdk_version()} "
+                           f"target={a.get_target_sdk_version()}")
+                log("ok", f"Perms   : {len(a.get_permissions())}")
+                return
+            except Exception as e:
+                log("warn", f"Androguard: {e}")
+            finally:
+                sys.stderr = _old_stderr
+
+        # Fallback: read package from decoded AndroidManifest.xml (apktool output)
+        # Works even without androguard as long as decompile ran.
+        if self.decompiled:
+            manifest = os.path.join(self.decompiled, "AndroidManifest.xml")
+            if os.path.isfile(manifest):
+                try:
+                    mt = open(manifest, encoding="utf-8", errors="ignore").read()
+                    m = re.search(r'package=(["\'])([A-Za-z][A-Za-z0-9._]+)\1', mt)
+                    pkg = m.group(2) if m else None
+                    if pkg and pkg != "android":
+                        self.package = pkg
+                        log("ok", f"Package : {C.BD}{self.package}{C.RS} "
+                            f"(from manifest – androguard not installed)")
+                        return
+                except Exception:
+                    pass
+
+        log("warn", "androguard not installed and manifest unreadable. "
+            "Install: pip install androguard")
 
     def decompile(self) -> bool:
         self.decompiled = os.path.join(self.work_dir, "decompiled")
@@ -3796,79 +3835,68 @@ class AndroidPatcher:
         if not unsigned:
             return None
         signed_base = self.sign(unsigned, slug)
-        base_name   = os.path.splitext(os.path.basename(self.target))[0]
+        if not signed_base or not os.path.isfile(signed_base):
+            log("err", "Signing failed – output not produced.")
+            return None
+        # Avoid generic names like "base" or "split_config.arm64_v8a" that
+        # come from split APK bundles. Use the APK package name instead.
+        _raw = os.path.splitext(os.path.basename(self.target))[0]
+        _generic_re = re.compile(
+            r'^(base|split[._\-]|config\.|classes\d*$)', re.IGNORECASE)
+        if _generic_re.match(_raw) and getattr(self, "package", "unknown") != "unknown":
+            base_name = getattr(self, "package", _raw).replace(".", "_")
+        else:
+            base_name = _raw
 
         # ── Re-sign all companion split APKs ─────────────────────────────────
         signed_splits: list[str] = []
         for split_path in self.split_apks:
+            if not os.path.isfile(split_path):
+                log("warn", f"Split not found, skipping: {split_path}", indent=1)
+                continue
             sp_name   = os.path.splitext(os.path.basename(split_path))[0]
             sp_signed = self.sign(split_path, sp_name)
             if sp_signed and os.path.isfile(sp_signed):
                 signed_splits.append(sp_signed)
 
-        # ── Determine final output path ───────────────────────────────────────
-        # --output-apk wins; else use output_dir
-        output_apk = getattr(self, "output_apk", None)
-        out_all    = getattr(self, "out_all", None)
-        default_name = f"{base_name}_{slug}.apk"
-        if output_apk:
-            final = os.path.abspath(output_apk)
-            os.makedirs(os.path.dirname(final) or ".", exist_ok=True)
-        else:
-            final = os.path.join(self.output_dir, default_name)
+        final = os.path.join(self.output_dir, f"{base_name}_{slug}.apk")
 
-        # ── Merge splits → single APK when splits present ────────────────────
-        merged_apk = None
         if signed_splits:
+            # ── Merge base + splits → single installable APK ─────────────────
+            # User gave a split archive as input; they expect ONE file back.
             log("info", f"Merging {len(signed_splits)} split(s) into base APK…")
-            merged_apk = self._merge_splits_into_base(signed_base, signed_splits)
-
-        # Pick what to copy to final destination
-        source_apk = merged_apk if (merged_apk and os.path.isfile(merged_apk)) else signed_base
-
-        try:
-            shutil.copy(source_apk, final)
-            if merged_apk and merged_apk != final:
-                try: os.unlink(merged_apk)
-                except: pass
-        except shutil.SameFileError:
-            final = source_apk
-
-        if merged_apk and os.path.isfile(final):
-            log("ok", f"Output (merged single APK): {C.G}{final}{C.RS}")
-        else:
-            log("ok", f"Output: {C.G}{final}{C.RS}")
-
-        # ── --out-all: copy base + splits + merged into a directory ───────────
-        if out_all:
-            os.makedirs(out_all, exist_ok=True)
-            # merged/base
-            shutil.copy(final, os.path.join(out_all, os.path.basename(final)))
-            log("ok", f"  [out-all] merged → {out_all}/", indent=1)
-            # original signed splits (re-signed)
+            merged = self._merge_splits_into_base(signed_base, signed_splits)
+            if merged and os.path.isfile(merged):
+                try:
+                    shutil.copy(merged, final)
+                    if merged != final:
+                        try: os.unlink(merged)
+                        except: pass
+                except shutil.SameFileError:
+                    final = merged
+                log("ok", f"Output (single APK): {C.G}{final}{C.RS}")
+                return final
+            # Merge failed – fall back to separate files + adb install-multiple
+            log("warn", "Merge failed – falling back to separate files.")
+            shutil.copy(signed_base, final)
+            log("ok", f"Output (base): {C.G}{final}{C.RS}")
+            split_outs: list[str] = []
             for sp in signed_splits:
-                sp_dest = os.path.join(out_all,
-                    os.path.splitext(os.path.basename(sp))[0] + "_resigned.apk")
-                shutil.copy(sp, sp_dest)
-                log("ok", f"  [out-all] split  → {sp_dest}", indent=1)
-            # original signed base
-            base_dest = os.path.join(out_all, f"{base_name}_{slug}_base.apk")
-            shutil.copy(signed_base, base_dest)
-            log("ok", f"  [out-all] base   → {base_dest}", indent=1)
-
-        # ── Fallback install hint when merge failed ───────────────────────────
-        if signed_splits and not merged_apk:
-            log("warn", "Split merge failed – use adb install-multiple:")
-            split_outs = []
-            for sp in signed_splits:
-                sp_out = os.path.join(self.output_dir,
+                sp_out = os.path.join(
+                    self.output_dir,
                     os.path.splitext(os.path.basename(sp))[0] + "_resigned.apk")
                 shutil.copy(sp, sp_out)
                 split_outs.append(sp_out)
-            adb_cmd = "adb install-multiple " + " ".join(
-                f'"{p}"' for p in [final] + split_outs)
+                log("ok", f"  Split: {sp_out}", indent=1)
+            adb_cmd = ("adb install-multiple " +
+                       " ".join(f'"{p}"' for p in [final] + split_outs))
+            log("ok", f"Install command:")
             log("info", f"  {adb_cmd}", indent=1)
+            return final
 
+        # ── No splits: single base APK ────────────────────────────────────────
+        shutil.copy(signed_base, final)
+        log("ok", f"Output: {C.G}{final}{C.RS}")
         return final
 
     # ── Main run ──────────────────────────────────────────────────────────────
@@ -3885,12 +3913,15 @@ class AndroidPatcher:
         self.detect_engine()
         if not self.decompile():
             return {}
-        self.detect_engine_post_decompile()
         self.analyze_with_androguard()
 
         log("head", "Smali Cache")
         cache = SmaliCache(self.decompiled)
         cache.load()
+
+        # Pass the already-loaded cache so detect_from_dir reuses memory
+        # instead of re-reading 30K+ smali files from disk a second time.
+        self.detect_engine_post_decompile(cache=cache)
 
         # ── Obfuscation analysis (skipped entirely when --no-deob) ─────────────
         # With --no-deob this block is completely bypassed – no smali scan,
@@ -3943,41 +3974,43 @@ class AndroidPatcher:
 
         # ── Runtime bridge + live console (optional) ──────────────────────────
         cfg = self.runtime_cfg
+        # needs_bridge → APK gets bridge smali injected.
+        # needs_listener → we also block and wait for live events.
+        # fake_google_verify alone: inject silently, no blocking wait.
+        needs_listener = cfg.trace_runtime or cfg.net_debug or cfg.learn
+
         if cfg.needs_bridge and final and os.path.exists(final):
             _print_runtime_instructions(cfg, final)
-            # Start bridge server + live console
-            db      = BehaviorProfileDB(cfg.profile_db) if cfg.learn else None
-            learner = LearningEngine(db) if cfg.learn else None
-            exc_ana = ExceptionAnalyzer()
-            console = LiveConsole(learn_engine=learner, exc_analyzer=exc_ana)
-            server  = BridgeServer(cfg.bridge_port, on_event=console.on_event,
-                                     bind_host=cfg.bridge_bind)
-            try:
-                server.start()
-                log("info", "Waiting for APK connection… (Ctrl+C to stop)")
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                server.stop()
-                console.print_stats()
-                if cfg.learn and learner and db:
-                    learner.print_summary()
-                    learner.generate_rules_file(cfg.rules_file)
-                    db.close()
+            if needs_listener:
+                db      = BehaviorProfileDB(cfg.profile_db) if cfg.learn else None
+                learner = LearningEngine(db) if cfg.learn else None
+                exc_ana = ExceptionAnalyzer()
+                console = LiveConsole(learn_engine=learner, exc_analyzer=exc_ana)
+                server  = BridgeServer(cfg.bridge_port, on_event=console.on_event,
+                                         bind_host=cfg.bridge_bind)
+                try:
+                    server.start()
+                    log("info", "Waiting for APK connection… (Ctrl+C to stop)")
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    server.stop()
+                    console.print_stats()
+                    if cfg.learn and learner and db:
+                        learner.print_summary()
+                        learner.generate_rules_file(cfg.rules_file)
+                        db.close()
+            else:
+                log("info", "Net interceptor injected (silent – no bridge listener).",
+                    indent=1)
+                log("info", "Add --trace-runtime or --net-debug to stream events.",
+                    indent=1)
         elif cfg.tls_intercept and final and os.path.exists(final):
             _print_runtime_instructions(cfg, final)
 
         elapsed = time.time() - t0
-        # -- Merge splits into single APK if requested
-        if getattr(self, 'merge_splits', False) and getattr(self, 'split_apks', []):
-            _sp = (list(self.split_apks.values())
-                   if isinstance(self.split_apks, dict) else list(self.split_apks))
-            _mg = self._merge_splits_into_base(final, _sp)
-            if _mg:
-                final = _mg
-                log('ok', f'Merged APK (single install): {C.G}{final}{C.RS}')
 
         log("head", f"Build Summary  ({elapsed:.0f}s)")
         label = patches_to_label(patches)
@@ -4334,6 +4367,7 @@ class RuntimeConfig:
     profile_db    : str  = "unguard_profile.db"
     rules_file    : str  = "unguard_rules.json"
     bridge_bind   : str  = "127.0.0.1"  # --bridge-bind (0.0.0.0 for Termux LAN)
+    bridge_host   : str  = ""            # --bridge-host (IP the APK connects TO)
 
     @property
     def any_runtime(self) -> bool:
@@ -5108,12 +5142,33 @@ class InstrumentationInjector:
 
     # ── Connect call injection ────────────────────────────────────────────────
     def _inject_connect_call(self) -> bool:
-        """Inject UGBridge.connectBackground("127.0.0.1", PORT) at app start."""
+        """Inject UGBridge.connectBackground(HOST, PORT) at app start.
+
+        Uses cfg.bridge_bind as the connect target unless it is 0.0.0.0
+        (listen-all), in which case the caller must set cfg.bridge_host to
+        the PC's LAN IP.  Falls back to 127.0.0.1 with a clear warning so
+        the user knows to run `adb forward tcp:PORT tcp:PORT`.
+        """
         entry = self._find_app_entry()
         if not entry:
             log("warn", "Bridge: could not locate app entry point – "
                 "bridge connect() not auto-injected. Add manually if needed.", indent=1)
             return False
+
+        # Resolve the IP the APK should connect TO
+        bind = self.cfg.bridge_bind
+        if bind == "0.0.0.0":
+            # Check if caller supplied an explicit host override
+            host = getattr(self.cfg, "bridge_host", None) or "127.0.0.1"
+            if host == "127.0.0.1":
+                log("warn",
+                    "Bridge bind is 0.0.0.0 but no --bridge-host set. "
+                    "APK will connect to 127.0.0.1 (device loopback). "
+                    "Run: adb forward tcp:{p} tcp:{p}".format(
+                        p=self.cfg.bridge_port), indent=1)
+        else:
+            host = bind   # e.g. "192.168.1.5" or "127.0.0.1"
+        self._bridge_connect_host = host
         return self._do_inject_connect(entry)
 
     def _do_inject_connect(self, sf: Path) -> bool:
@@ -5139,8 +5194,9 @@ class InstrumentationInjector:
                     i += 1; continue
                 r1 = r0 + 1
                 port_lit = f"0x{self.cfg.bridge_port:x}"
+                _connect_host = getattr(self, "_bridge_connect_host", "127.0.0.1")
                 hook = [
-                    f'    const-string v{r0}, "127.0.0.1"\n',
+                    f'    const-string v{r0}, "{_connect_host}"\n',
                     f'    const/16 v{r1}, {port_lit}\n',
                     f'    invoke-static {{v{r0}, v{r1}}}, '
                     f'{self.BRIDGE_CLS}->connectBackground('
@@ -6019,12 +6075,8 @@ def main():
     )
 
     og = parser.add_argument_group("Output")
-    og.add_argument("-o", "--output", default=None, metavar="DIR",
-        help="Output directory for all produced files (default: current dir)")
-    og.add_argument("--output-apk", default=None, metavar="FILE.apk",
-        help="Write final merged/patched APK to this exact path")
-    og.add_argument("--out-all", default=None, metavar="DIR",
-        help="Copy base APK, all split APKs, and merged APK into this directory")
+    og.add_argument("-o","--output", default=None, metavar="DIR",
+        help="Output directory (APK or smali mode)")
     og.add_argument("--work-dir", default=None, metavar="DIR",
         help="Override temp workspace directory (APK mode only)")
     og.add_argument("--report", default=None, metavar="FILE",
@@ -6090,6 +6142,10 @@ def main():
         help="SQLite profile database path (--learn / --hybrid).")
     rg.add_argument("--rules-file", default="unguard_rules.json", metavar="FILE",
         help="JSON rules file path (--learn writes, --hybrid reads).")
+    rg.add_argument("--bridge-host", default=None, metavar="IP",
+        help="IP the APK should connect TO (injected into smali). "
+             "Needed when --bridge-bind 0.0.0.0 without adb forward. "
+             "Example: --bridge-host 192.168.1.5")
     rg.add_argument("--bridge-bind", default="127.0.0.1", metavar="HOST",
         help="Bridge server bind address. Default 127.0.0.1 (secure). "
              "Use 0.0.0.0 for Termux when bridging from a PC over USB adb forward.")
@@ -6187,6 +6243,7 @@ def main():
         profile_db    = getattr(args, "profile_db",    "unguard_profile.db"),
         rules_file    = getattr(args, "rules_file",    "unguard_rules.json"),
         bridge_bind   = getattr(args, "bridge_bind",   "127.0.0.1"),
+        bridge_host   = getattr(args, "bridge_host",   "") or "",
     )
     if rt_cfg.any_runtime:
         active = [f for f in ("trace_runtime","tls_intercept","learn",
@@ -6207,8 +6264,6 @@ def main():
         workers     = MAX_WORKERS,
         runtime_cfg = rt_cfg,
     )
-    patcher.output_apk = getattr(args, "output_apk", None)
-    patcher.out_all    = getattr(args, "out_all", None)
 
     ok = False
     try:
